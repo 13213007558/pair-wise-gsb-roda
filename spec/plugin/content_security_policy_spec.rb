@@ -1,6 +1,28 @@
 require_relative "../spec_helper"
+require_relative "../../lib/roda/plugins/content_security_policy"
 
 describe "content_security_policy plugin" do 
+  def csp_policy(&block)
+    Roda::RodaPlugins::ContentSecurityPolicy::Policy.new(&block)
+  end
+
+  def csp_policy_collection_class
+    Roda::RodaPlugins::ContentSecurityPolicy::Policy::PolicyCollection
+  end
+
+  def script_allowed?(policy, source)
+    policies = if policy.is_a?(csp_policy_collection_class)
+      policy.to_a
+    else
+      [policy]
+    end
+
+    policies.all? do |csp|
+      sources = csp.get_script_src || csp.get_default_src
+      sources.include?(source)
+    end
+  end
+
   it "does not add header if no options are set" do
     app(:content_security_policy){|_| 'a'}
     header(RodaResponseHeaders::CONTENT_SECURITY_POLICY, "/a").must_be_nil
@@ -99,6 +121,128 @@ describe "content_security_policy plugin" do
     header(RodaResponseHeaders::CONTENT_SECURITY_POLICY_REPORT_ONLY, "/block").must_equal "default-src 'self' foo.com bar.com; img-src 'none'; block-all-mixed-content; "
 
     header(RodaResponseHeaders::CONTENT_SECURITY_POLICY, "/clear").must_equal "default-src foo.com bar.com; "
+  end
+
+  it "combines independent policies without granting newly appended sources" do
+    parent = csp_policy do |csp|
+      csp.default_src :none
+      csp.script_src :self, 'allowed.example'
+    end
+
+    child = csp_policy do |csp|
+      csp.default_src :none
+      csp.script_src 'allowed.example', :self, 'added.example'
+    end
+
+    combined = parent.combine(child)
+    combined.must_be_instance_of Roda::RodaPlugins::ContentSecurityPolicy::Policy
+    combined.get_default_src.must_equal [:none]
+    combined.get_script_src.must_equal [:self, 'allowed.example']
+
+    [[:self, true], ['allowed.example', true], ['added.example', false], ['blocked.example', false]].each do |source, expected|
+      script_allowed?(parent, source).must_equal expected
+      script_allowed?(combined, source).must_equal expected
+    end
+
+    script_allowed?(child, 'added.example').must_equal true
+    script_allowed?(combined, 'added.example').must_equal false
+    combined.combine(csp_policy{|csp| csp.default_src :none; csp.script_src :self}).must_be_instance_of Roda::RodaPlugins::ContentSecurityPolicy::Policy
+  end
+
+  it "keeps nonce, hash, strict-dynamic, sandbox, and different fallback policies separate" do
+    parent = csp_policy do |csp|
+      csp.default_src :none
+      csp.script_src :self
+    end
+    nonce = csp_policy do |csp|
+      csp.default_src :none
+      csp.script_src [:nonce, 'abc']
+    end
+    hash = csp_policy do |csp|
+      csp.default_src :none
+      csp.script_src [:sha256, 'def']
+    end
+    strict_dynamic = csp_policy do |csp|
+      csp.default_src :none
+      csp.script_src :strict_dynamic
+    end
+    sandbox = csp_policy do |csp|
+      csp.sandbox
+    end
+    fallback = csp_policy do |csp|
+      csp.default_src :self
+    end
+
+    combined = Roda::RodaPlugins::ContentSecurityPolicy::Policy.combine(parent, nonce, hash, strict_dynamic)
+    combined.must_be_kind_of csp_policy_collection_class
+    combined.to_a.length.must_equal 4
+    combined.header_values.must_equal [
+      "default-src 'none'; script-src 'self'; ",
+      "default-src 'none'; script-src 'nonce-abc'; ",
+      "default-src 'none'; script-src 'sha256-def'; ",
+      "default-src 'none'; script-src 'strict-dynamic'; "
+    ]
+
+    sandbox_combined = parent.combine(sandbox)
+    sandbox_combined.must_be_kind_of csp_policy_collection_class
+    sandbox_combined.to_a.length.must_equal 2
+    sandbox_combined.header_values.last.must_equal "sandbox; "
+
+    fallback_combined = parent.combine(fallback)
+    fallback_combined.must_be_kind_of csp_policy_collection_class
+    fallback_combined.to_a.length.must_equal 2
+  end
+
+  it "combines the response policy with an independent policy in routes" do
+    nonce_policy = csp_policy do |csp|
+      csp.default_src :none
+      csp.script_src [:nonce, 'abc']
+    end
+
+    app(:bare) do
+      plugin :content_security_policy do |csp|
+        csp.default_src :none
+        csp.script_src :self
+      end
+
+      route do |r|
+        r.get 'tighten' do
+          combine_content_security_policy do |csp|
+            csp.default_src :none
+            csp.script_src :self, 'child.example'
+          end
+          ''
+        end
+
+        r.get 'nonce' do
+          combine_content_security_policy(nonce_policy)
+          ''
+        end
+
+        'a'
+      end
+    end
+
+    parent_header = "default-src 'none'; script-src 'self'; "
+    header(RodaResponseHeaders::CONTENT_SECURITY_POLICY, "/a").must_equal parent_header
+    header(RodaResponseHeaders::CONTENT_SECURITY_POLICY, "/tighten").must_equal parent_header
+    app.content_security_policy.header_value.must_equal parent_header
+
+    nonce_header = [parent_header, "default-src 'none'; script-src 'nonce-abc'; "]
+    unless Rack.release >= '3'
+      nonce_header = nonce_header.map{|value| value.sub(/; \z/, '')}.join(', ')
+    end
+    header(RodaResponseHeaders::CONTENT_SECURITY_POLICY, "/nonce").must_equal nonce_header
+  end
+
+  it "does not combine enforced policies with report-only policies" do
+    enforced = csp_policy{|csp| csp.default_src :self}
+    report_only = csp_policy do |csp|
+      csp.default_src :self
+      csp.report_only
+    end
+
+    proc{enforced.combine(report_only)}.must_raise Roda::RodaError
   end
 
   it "raises error for unsupported CSP values" do

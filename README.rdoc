@@ -975,6 +975,20 @@ content security policy configuration:
     end
   end
 
+When a branch needs to tighten the policy, combine an independent policy instead
+of overriding the copied parent policy.  The browser must satisfy every combined
+policy.  Equivalent ordinary source lists are normalized into one policy; policies
+using nonces, hashes, +'strict-dynamic'+, +sandbox+, or different fallbacks are
+kept as separate Content-Security-Policy header fields so permissions are never
+broadened:
+
+  r.get 'admin' do
+    combine_content_security_policy do |csp|
+      csp.default_src :none
+      csp.script_src :self
+    end
+  end
+
 === Other Security Related HTTP Headers
 
 You may want to look into setting the following HTTP headers, which
