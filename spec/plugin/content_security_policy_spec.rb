@@ -149,6 +149,153 @@ describe "content_security_policy plugin" do
     header(RodaResponseHeaders::CONTENT_SECURITY_POLICY).must_equal "default_src 'none';"
   end
 
+  it "combines independent policies without granting the parent policy's permissions" do
+    child_policy = Roda::RodaPlugins::ContentSecurityPolicy::Policy.new do |csp|
+      csp.script_src 'parent.example.com', 'object.example.com'
+    end
+
+    app(:bare) do
+      plugin :content_security_policy do |csp|
+        csp.default_src :none
+        csp.img_src :self, 'parent.example.com'
+        csp.script_src 'parent.example.com', 'duplicate.example.com', 'duplicate.example.com'
+      end
+
+      route do |r|
+        r.get 'override' do
+          content_security_policy.script_src :self, 'child.example.com'
+          ''
+        end
+
+        r.get 'combined' do
+          combine_content_security_policy do |csp|
+            csp.script_src 'parent.example.com', 'child.example.com', 'duplicate.example.com'
+          end
+          ''
+        end
+
+        r.get 'object' do
+          combine_content_security_policy(child_policy)
+          ''
+        end
+
+        r.get 'nonce' do
+          combine_content_security_policy do |csp|
+            csp.script_src 'parent.example.com', [:nonce, 'token']
+          end
+          ''
+        end
+
+        r.get 'hash' do
+          combine_content_security_policy do |csp|
+            csp.script_src 'parent.example.com', [:sha256, 'abc']
+          end
+          ''
+        end
+
+        r.get 'strict' do
+          combine_content_security_policy do |csp|
+            csp.script_src 'parent.example.com', :strict_dynamic
+          end
+          ''
+        end
+
+        r.get 'sandbox' do
+          combine_content_security_policy do |csp|
+            csp.sandbox 'allow-scripts'
+          end
+          ''
+        end
+
+        r.get 'fallback' do
+          combine_content_security_policy do |csp|
+            csp.script_src 'parent.example.com', 'child.example.com'
+            csp.img_src :self, 'parent.example.com', 'child.example.com'
+          end
+          ''
+        end
+
+        ''
+      end
+    end
+
+    policies = ->(path) { Array(header(RodaResponseHeaders::CONTENT_SECURITY_POLICY, path)) }
+    directive_sources = ->(policy, directive) do
+      match = /(?:^|; )#{Regexp.escape(directive)} ([^;]+)/.match(policy)
+      match ? match[1].split : nil
+    end
+    allows = ->(policy_values, directive, source) do
+      policy_values.all? do |policy|
+        sources = directive_sources.call(policy, directive) || directive_sources.call(policy, 'default-src')
+        next false unless sources
+        sources.include?(source)
+      end
+    end
+
+    override_header = header(RodaResponseHeaders::CONTENT_SECURITY_POLICY, '/override')
+    refute_match(/script-src[^;]*parent\.example\.com/, override_header)
+
+    combined_values = policies.call('/combined')
+    combined_values.length.must_equal 2
+    assert_equal combined_values.first, "default-src 'none'; img-src 'self' parent.example.com; script-src parent.example.com duplicate.example.com duplicate.example.com; "
+
+    resource_expectations = {
+      "'self'" => false,
+      'parent.example.com' => true,
+      'child.example.com' => false,
+      'other.example.com' => false
+    }
+
+    parent_values = policies.call('/')
+    resource_expectations.each do |source, expected|
+      allows.call(parent_values, 'script-src', source).must_equal expected
+      allows.call(combined_values, 'script-src', source).must_equal expected
+    end
+
+    object_values = policies.call('/object')
+    object_values.length.must_equal 2
+    allows.call(object_values, 'script-src', 'object.example.com').must_equal false
+    allows.call(object_values, 'script-src', 'parent.example.com').must_equal true
+
+    %w'/nonce /hash /strict /sandbox /fallback'.each do |path|
+      values = policies.call(path)
+      values.length.must_equal 2
+      allows.call(values, 'script-src', 'child.example.com').must_equal false
+    end
+
+    policies.call('/nonce').last.must_include "'nonce-token'"
+    policies.call('/hash').last.must_include "'sha256-abc'"
+    policies.call('/strict').last.must_include "'strict-dynamic'"
+    policies.call('/sandbox').last.must_include "sandbox allow-scripts;"
+  end
+
+  it "supports combining independent policy objects and normalizes equivalent lists" do
+    app(:content_security_policy){|_| ''}
+    parent = Roda::RodaPlugins::ContentSecurityPolicy::Policy.new do |csp|
+      csp.script_src 'parent.example.com', 'shared.example.com'
+    end
+    child = Roda::RodaPlugins::ContentSecurityPolicy::Policy.new do |csp|
+      csp.script_src 'shared.example.com', 'child.example.com'
+    end
+    other = Roda::RodaPlugins::ContentSecurityPolicy::Policy.new do |csp|
+      csp.img_src 'another.example.com'
+    end
+    boolean = Roda::RodaPlugins::ContentSecurityPolicy::Policy.new do |csp|
+      csp.block_all_mixed_content
+    end
+
+    combined = parent.combine(child)
+    combined.must_be_kind_of Roda::RodaPlugins::ContentSecurityPolicy::Policy
+    combined.header_value.must_equal "script-src shared.example.com; "
+
+    combined_set = parent.combine(child, other)
+    combined_set.must_be_kind_of Roda::RodaPlugins::ContentSecurityPolicy::PolicySet
+
+    combined_boolean = child.combine(boolean)
+    combined_boolean.must_be_kind_of Roda::RodaPlugins::ContentSecurityPolicy::PolicySet
+    assert combined_boolean.policies.any?{|policy| policy.header_value.include?('block-all-mixed-content')}
+  end
+
   it "should not set header when using response.skip_content_security_policy!" do
     app(:bare) do
       plugin :content_security_policy do |csp|

@@ -975,6 +975,27 @@ content security policy configuration:
     end
   end
 
+For a route that needs additional restrictions without losing the parent
+application's restrictions, use +combine_content_security_policy+ instead of
+overriding the current policy.  Browsers enforce all combined policies, so a
+source allowed by an additional policy must also be allowed by the parent
+policy:
+
+  class App < Roda
+    route do |r|
+      r.get 'restricted' do
+        combine_content_security_policy do |csp|
+          csp.script_src :self, 'https://widgets.example.com'
+        end
+      end
+    end
+  end
+
+Equivalent ordinary source lists are normalized into one policy.  When merging
+would not be provably equivalent, such as with nonces, hashes,
++'strict-dynamic'+, +sandbox+, or different fallback directives, Roda sends
+multiple Content-Security-Policy headers instead of weakening the restrictions.
+
 === Other Security Related HTTP Headers
 
 You may want to look into setting the following HTTP headers, which
