@@ -248,6 +248,7 @@ class Roda
     # +:invalid_value_message+ :: The message to use for type conversions that result in a nil value
     #                             (a space and the parameter name is appended to this).
     # +:max_input_bytesize+ :: The maximum bytesize of string input.
+    # +:depends_on+ :: Parameter dependencies that must be converted before this type.
     # 
     # You can override the invalid value message of an existing type using the
     # +invalid_value_message+ method.  You can also override the max input bytesize of an existing
@@ -263,6 +264,50 @@ class Roda
     #     max_input_bytesize(:date, 256)
     #     invalid_value_message(:pos_int, "value must be greater than 0 for parameter")
     #   end
+    #
+    # Custom types can declare parameter dependencies with <tt>:depends_on</tt>.
+    # Dependencies are converted on demand, relative to the object being converted,
+    # and passed as keyword arguments to the conversion block:
+    #
+    #   plugin :typecast_params do
+    #     handle_type(:zoned_time, depends_on: :timezone) do |value, timezone:|
+    #       Time.parse(value).in_time_zone(timezone)
+    #     end
+    #
+    #     handle_type(:money, depends_on: {currency: :currency}) do |value, currency:|
+    #       Money.new(value, currency)
+    #     end
+    #   end
+    #
+    # For dependencies with a different parameter name, use a type/key pair:
+    #   plugin :typecast_params do
+    #     handle_type(:money, depends_on: {currency: [:str, 'currency_code']}) do |value, currency:|
+    #       Money.new(value, currency)
+    #     end
+    #   end
+    #
+    # Dependencies are scoped to the object being converted, so the same declared
+    # type can be used in nested objects and in members converted by convert_each!.
+    # If a dependency cannot be converted, dependent fields are marked +:blocked+
+    # and are not converted; defaults for dependent fields are not used.  Other
+    # unrelated conversions continue to be processed and their errors are still
+    # collected by convert!.
+    #
+    # Callable dependencies can be used when a dependency value must be computed
+    # through the Params object.  The same callable is resolved only once per
+    # request, so callables with side effects are safe to share between
+    # dependencies:
+    #
+    #   plugin :typecast_params do
+    #     handle_type(:charged, depends_on: {
+    #       amount: {converter: ->(tp) { tp.Integer!('amount') }}
+    #     }) do |value, amount:|
+    #       value.to_i == amount
+    #     end
+    #   end
+    #
+    # Unknown dependency types and static dependency cycles raise
+    # TypecastParams::ProgrammerError before request processing.
     #
     # By default, the typecast_params conversion procs are passed the parameter value directly
     # from +request.params+ without modification.  In some cases, it may be beneficial to
@@ -311,6 +356,9 @@ class Roda
 
       # Sentinal value for whether to raise exception during #process
       CHECK_NIL = Object.new.freeze
+
+      # Sentinel value used internally when a dependency cannot be converted.
+      DEPENDENCY_BLOCKED = Object.new.freeze
 
       # Exception class for errors that are caused by misuse of the API by the programmer.
       # These are different from +Error+ which are raised because the submitted parameters
@@ -443,6 +491,133 @@ class Roda
 
       # Class handling conversion of submitted parameters to desired types.
       class Params
+        # Dependencies declared for custom conversion types.  Keys are type
+        # symbols and values are the dependency specifications accepted by
+        # handle_type.
+        def self.type_dependencies
+          @type_dependencies ||= if superclass.respond_to?(:type_dependencies, true)
+            superclass.send(:type_dependencies).dup
+          else
+            {}
+          end
+        end
+
+        # Validate that all statically declared dependencies reference known
+        # types and that the dependency graph is acyclic.  This is run when an
+        # application is frozen and again before processing the first request.
+        def self.validate_type_dependencies!
+          return if @type_dependencies_validated
+
+          dependencies = type_dependencies
+          dependencies.each_key do |type|
+            validate_dependency_type(type, dependencies, [])
+          end
+
+          @type_dependencies_validated = true
+        end
+
+        def self.validate_dependency_type(type, dependencies, path)
+          if path.include?(type)
+            cycle = path[path.index(type)..-1] + [type]
+            raise ProgrammerError, "cyclic typecast_params dependency: #{cycle.map(&:inspect).join(" -> ")}"
+          end
+
+          normalized_type_dependencies(type).each_value do |spec|
+            dependency_type = spec[:type]
+            next unless dependency_type
+
+            unless private_method_defined?("_convert_array_#{dependency_type}")
+              raise ProgrammerError, "unknown typecast_params dependency type #{dependency_type.inspect} for #{type.inspect}"
+            end
+
+            validate_dependency_type(dependency_type, dependencies, path + [type])
+          end
+        end
+        private_class_method :validate_dependency_type
+
+        def self.normalized_type_dependencies(type)
+          deps = type_dependencies[type]
+          return {} unless deps
+
+          if deps.is_a?(Hash)
+            {}.tap{|normalized| normalize_type_dependency(deps, normalized)}
+          else
+            Array(deps).each_with_object({}) do |dep, normalized_dependencies|
+              normalize_type_dependency(dep, normalized_dependencies)
+            end
+          end
+        end
+        private_class_method :normalized_type_dependencies
+
+        def self.normalize_type_dependency(dep, normalized)
+          case dep
+          when Symbol
+            normalized[dep] = {:type=>dep, :key=>dep.to_s}
+          when Array
+            type, key = dep
+            unless type.is_a?(Symbol)
+              raise ProgrammerError, "unsupported typecast_params dependency type: #{type.inspect}"
+            end
+            key = normalized_dependency_key(key)
+            normalized[type] = {:type=>type, :key=>key}
+          when Hash
+            dep.each do |name, spec|
+              name = name.to_sym
+
+              case spec
+              when Symbol
+                normalized[name] = {:type=>spec.to_sym, :key=>name.to_s}
+              when Array
+                type = spec[0]
+                unless type.is_a?(Symbol)
+                  raise ProgrammerError, "unsupported typecast_params dependency type: #{type.inspect}"
+                end
+                key = normalized_dependency_key(spec[1] || name.to_s)
+                normalized[name] = {:type=>type, :key=>key}
+              when Proc, Method
+                normalized[name] = {:converter=>spec}
+              when Hash
+                key = normalized_dependency_key(spec[:key] || name)
+                normalized[name] = {
+                  :type=>spec[:type] && spec[:type].to_sym,
+                  :key=>key,
+                  :converter=>spec[:converter]
+                }
+              else
+                raise ProgrammerError, "unsupported typecast_params dependency: #{spec.inspect}"
+              end
+            end
+          when Proc, Method
+            raise ProgrammerError, "a callable typecast_params dependency must be named in a hash"
+          else
+            raise ProgrammerError, "unsupported typecast_params dependency: #{dep.inspect}"
+          end
+        end
+        private_class_method :normalize_type_dependency
+
+        def self.normalized_dependency_key(key)
+          case key
+          when String, Integer
+            key
+          when Symbol
+            key.to_s
+          when Array
+            key.map do |part|
+              case part
+              when String, Integer
+                part
+              when Symbol
+                part.to_s
+              else
+                raise ProgrammerError, "invalid typecast_params dependency key: #{key.inspect}"
+              end
+            end
+          else
+            raise ProgrammerError, "invalid typecast_params dependency key: #{key.inspect}"
+          end
+        end
+        private_class_method :normalized_dependency_key
+
         # Handle conversions for the given type using the given block.
         # For a type named +foo+, this will create the following methods:
         #
@@ -460,13 +635,25 @@ class Roda
           convert_meth = :"convert_#{type}"
           define_method(convert_meth, &block)
 
+          dependency_spec = opts[:depends_on] || opts[:dependencies]
+          if dependency_spec
+            type_dependencies[type] = dependency_spec
+            @type_dependencies_validated = false
+          end
+
           convert_array_meth = :"_convert_array_#{type}"
-          define_method(convert_array_meth) do |v|
+          define_method(convert_array_meth) do |v, dependencies=nil|
             raise Error, "expected array but received #{v.inspect}" unless v.is_a?(Array)
-            v.map! do |val|
+            dependencies ||= resolve_type_dependencies(type)
+
+            if dependency_blocked?(dependencies)
+              raise Error, "dependency conversion failed"
+            end
+
+            v.map do |val|
               check_allowed_bytesize(val, _max_input_bytesize_for(type))
               check_null_byte(val)
-              send(convert_meth, val)
+              call_conversion(convert_meth, val, dependencies)
             end
           end
 
@@ -507,8 +694,14 @@ class Roda
         def self.nest(obj, nesting)
           v = allocate
           v.instance_variable_set(:@nesting, nesting)
+          v.instance_variable_set(:@_typecast_context, {:dependency_cache=>{}, :resolving=>{}, :dependency_captures=>[]})
           v.send(:initialize, obj)
           v
+        end
+
+        def self.freeze
+          validate_type_dependencies!
+          super
         end
 
         handle_type(:any) do |v|
@@ -599,6 +792,9 @@ class Roda
         # Set the object used for converting.  Conversion methods will convert members of
         # the passed object.
         def initialize(obj)
+          self.class.validate_type_dependencies!
+          @_typecast_context ||= {:dependency_cache=>{}, :resolving=>{}, :dependency_captures=>[]}
+
           case @obj = obj
           when Hash, Array
             # nothing
@@ -654,6 +850,7 @@ class Roda
           end
 
           @subs[key] = sub
+          sub.instance_variable_set(:@_typecast_context, typecast_context)
           sub.sub_capture(@capture, @symbolize, @skip_missing)
           sub
         end
@@ -1006,7 +1203,7 @@ class Roda
           when String
             v = process(meth, key, default, type)
 
-            if @capture
+            if @capture && typecast_context[:dependency_captures].empty?
               key = key.to_sym if symbolize?
               if !@skip_missing || @obj.has_key?(key)
                 @params[key] = v
@@ -1048,6 +1245,112 @@ class Roda
           end
         end
 
+        def typecast_context
+          @_typecast_context
+        end
+
+        def call_conversion(meth, value, dependencies)
+          if dependencies.empty?
+            send(meth, value)
+          else
+            send(meth, value, **dependencies)
+          end
+        end
+
+        def resolve_type_dependencies(type)
+          specs = self.class.send(:normalized_type_dependencies, type)
+          return {} if specs.empty?
+
+          specs.each_with_object({}) do |(name, spec), dependencies|
+            dependencies[name] = resolve_dependency(type, name, spec)
+          end
+        end
+
+        def resolve_dependency(type, name, spec)
+          path = spec[:key]
+          converter = spec[:converter]
+          cache_key = if converter
+            [:converter, object_id, converter.object_id]
+          else
+            [:type, spec[:type], Array(@nesting), Array(path)]
+          end
+
+          cache = typecast_context[:dependency_cache]
+          if cached = cache[cache_key]
+            return cached[0] ? cached[1] : DEPENDENCY_BLOCKED
+          end
+
+          if typecast_context[:resolving][cache_key]
+            raise ProgrammerError, "cyclic typecast_params dependency for #{name.inspect} in #{type.inspect}"
+          end
+
+          typecast_context[:resolving][cache_key] = true
+          previous_capture_state = [@capture, @params, @symbolize, @skip_missing]
+          dependency_capture = []
+          typecast_context[:dependency_captures].push(dependency_capture)
+          @capture = dependency_capture
+          dependency_error = nil
+          result = nil
+
+          begin
+            result = if converter
+              previous_suppress = typecast_context[:suppress_dependency_errors]
+              typecast_context[:suppress_dependency_errors] = true
+              begin
+                converter.call(self)
+              ensure
+                typecast_context[:suppress_dependency_errors] = previous_suppress
+              end
+            else
+              parts = Array(path).dup
+              key = parts.pop
+              target = parts.empty? ? self : subkey(parts, true)
+              if target
+                target.send(:_convert_dependency!, spec[:type], key, true)
+              end
+            end
+
+            cache[cache_key] = [true, result]
+          rescue Error, ArgumentError => e
+            cache[cache_key] = [false]
+            dependency_error = Error.create(keys(Array(path).first), spec[:type], e)
+            DEPENDENCY_BLOCKED
+          ensure
+            typecast_context[:dependency_captures].pop
+            @capture, @params, @symbolize, @skip_missing = previous_capture_state
+            typecast_context[:resolving].delete(cache_key)
+            if dependency_error
+              if @capture
+                @capture << dependency_error unless @capture.include?(dependency_error)
+              else
+                raise dependency_error
+              end
+            end
+          end
+
+          dependency_error ? DEPENDENCY_BLOCKED : result
+        end
+
+        def dependency_blocked?(dependencies)
+          dependencies.value?(DEPENDENCY_BLOCKED)
+        end
+
+        def _convert_dependency!(type, key, required=false)
+          meth = :"convert_#{type}"
+          previous_suppress = typecast_context[:suppress_dependency_errors]
+          typecast_context[:suppress_dependency_errors] = true
+          @capture, previous_capture = nil, @capture
+          process(meth, key, required ? CHECK_NIL : nil, type)
+        ensure
+          @capture = previous_capture
+          typecast_context[:suppress_dependency_errors] = previous_suppress
+        end
+
+        def handle_blocked_dependency(key)
+          handle_error(key, :blocked, "parameter #{param_name(key)} depends on a parameter that could not be converted")
+          nil
+        end
+
         # Get the value of +key+ for the object, and convert it to the expected type using +meth+.
         # If the value either before or after conversion is nil, return the +default+ value.
         def process(meth, key, default, type)
@@ -1060,7 +1363,21 @@ class Roda
           else
             check_allowed_bytesize(v, _max_input_bytesize_for(type))
             check_null_byte(v)
-            v = send(meth, v)
+            dependencies = resolve_type_dependencies(type)
+
+            if dependency_blocked?(dependencies)
+              begin
+                handle_blocked_dependency(key)
+              rescue Error
+              end
+              return
+            end
+
+            if meth.to_s.start_with?("_convert_array_")
+              v = send(meth, v, dependencies)
+            else
+              v = call_conversion(meth, v, dependencies)
+            end
           end
 
           if v.nil?
@@ -1075,6 +1392,7 @@ class Roda
             v
           end
         rescue => e
+          raise if typecast_context[:suppress_dependency_errors]
           handle_error(key, meth.to_s.sub(/\A_?convert_/, '').to_sym, e)
         end
 
@@ -1161,6 +1479,7 @@ class Roda
         # to the request's params (merging query string params and body params).
         # Type conversion methods will be called on the result of this method.
         def typecast_params
+          self.class::TypecastParams.validate_type_dependencies!
           @_typecast_params ||= self.class::TypecastParams.new(@_request.params)
         end
 
@@ -1168,6 +1487,7 @@ class Roda
         # access to parameters in the request's query string.
         # Type conversion methods will be called on the result of this method.
         def typecast_query_params
+          self.class::TypecastParams.validate_type_dependencies!
           @_typecast_query_params ||= self.class::TypecastParams.new(@_request.GET)
         end
 
@@ -1175,6 +1495,7 @@ class Roda
         # access to parameters in the request's body.
         # Type conversion methods will be called on the result of this method.
         def typecast_body_params
+          self.class::TypecastParams.validate_type_dependencies!
           @_typecast_body_params ||= self.class::TypecastParams.new(@_request.POST)
         end
       end

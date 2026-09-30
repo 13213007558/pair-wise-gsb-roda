@@ -1,4 +1,5 @@
 require_relative "../spec_helper"
+require "roda/plugins/typecast_params"
 require 'tempfile'
 
 describe "typecast_params plugin" do 
@@ -1654,4 +1655,184 @@ describe "typecast_params plugin with strip: :all option" do
   it "#should not attempt to strip non-String values" do
     @tp.call("a[]=1").any('a').must_equal ["1"]
   end
+end
+
+describe "typecast_params plugin type dependencies" do
+  ErrorClass = Roda::RodaPlugins::TypecastParams::Error
+  ProgrammerErrorClass = Roda::RodaPlugins::TypecastParams::ProgrammerError
+
+  def params_class(calls=nil, &block)
+    klass = Class.new(Roda::RodaPlugins::TypecastParams::Params)
+    klass.class_exec do
+      handle_type(:zone) do |v|
+        raise ErrorClass, "invalid zone" unless v == 'Asia/Shanghai'
+        v
+      end
+
+      handle_type(:zoned_time, :depends_on=>:zone) do |v, zone:|
+        Time.parse(v).getlocal('+08:00') if zone == 'Asia/Shanghai'
+      end
+
+      handle_type(:currency) do |v|
+        raise ErrorClass, "invalid currency" unless %w'USD EUR'.include?(v)
+        v
+      end
+
+      handle_type(:money, :depends_on=>{:currency=>:currency}) do |v, currency:|
+        {:amount=>::Kernel::Integer(v, 10), :currency=>currency}
+      end
+
+      if calls
+        handle_type(:shared, :depends_on=>{
+          :once=>{:converter=>proc do |tp|
+            calls << 1
+            tp.send(:_convert_dependency!, :int, 'shared_value', true)
+          end},
+          :again=>{:converter=>proc do |tp|
+            tp.send(:_convert_dependency!, :int, 'shared_value', true)
+          end}
+        }) {|v, once:, again:| v.to_i + once + again}
+      end
+
+      class_exec(&block) if block
+    end
+    klass
+  end
+
+  def typecast(params, calls=nil, &block)
+    params_class(calls, &block).new(params)
+  end
+
+  def conversion_error(params, &block)
+    params = typecast(params, &block)
+    begin
+      params.convert! do |tp|
+        tp.zoned_time('end_at')
+        tp.money('amount')
+        tp.Integer('unrelated')
+      end
+    rescue ErrorClass => e
+      return e
+    end
+  end
+
+  before do
+    @calls = []
+  end
+
+  it "converts dependencies before dependent fields" do
+    params = {
+      'zone'=>'Asia/Shanghai',
+      'end_at'=>'2026-01-01T01:00:00Z',
+      'currency'=>'USD',
+      'amount'=>'10'
+    }
+
+    result = typecast(params).convert! do |tp|
+      tp.zoned_time!('end_at')
+      tp.money!('amount')
+    end
+
+    result['end_at'].must_equal Time.new(2026, 1, 1, 9, 0, 0, '+08:00')
+    result['amount'].must_equal(:amount=>10, :currency=>'USD')
+  end
+
+  it "supports relative dependencies in nested objects and arrays" do
+    params = {
+      'event'=>{
+        'zone'=>'Asia/Shanghai',
+        'end_at'=>'2026-01-01T01:00:00Z'
+      },
+      'items'=>[
+        {'currency'=>'USD', 'amount'=>'10'},
+        {'currency'=>'EUR', 'amount'=>'20'}
+      ]
+    }
+
+    result = typecast(params).convert! do |tp|
+      tp['event'].zoned_time!('end_at')
+      tp['items'].convert_each! do |item|
+        item.money!('amount')
+      end
+    end
+
+    result['event']['end_at'].must_equal Time.new(2026, 1, 1, 9, 0, 0, '+08:00')
+    result['items'].must_equal [
+      {'amount'=>{:amount=>10, :currency=>'USD'}},
+      {'amount'=>{:amount=>20, :currency=>'EUR'}}
+    ]
+  end
+
+  it "marks dependent fields blocked but still collects unrelated errors" do
+    e = conversion_error(
+      'zone'=>'UTC',
+      'end_at'=>'2026-01-01T01:00:00Z',
+      'currency'=>'USD',
+      'amount'=>'10',
+      'unrelated'=>'bad'
+    )
+
+    e.param_names.must_equal ['zone', 'end_at', 'unrelated']
+    e.all_errors.map(&:reason).must_equal [:zone, :blocked, :Integer]
+  end
+
+  it "does not use defaults when a dependency fails" do
+    params = typecast(
+      'zone'=>'UTC',
+      'end_at'=>'2026-01-01T01:00:00Z',
+      'currency'=>'USD',
+      'amount'=>'10'
+    )
+
+    begin
+      params.convert! do |tp|
+        tp.zoned_time('end_at', :default)
+        tp.money('amount', :default)
+      end
+    rescue ErrorClass => e
+    end
+
+    e.param_names.must_equal ['zone', 'end_at']
+  end
+
+  it "does not modify submitted params" do
+    params = {
+      'values'=>['1', '2'],
+      'currency'=>'USD',
+      'amount'=>'10'
+    }
+    original = Marshal.load(Marshal.dump(params))
+
+    typecast(params).convert! do |tp|
+      tp.array(:int, 'values')
+      tp.money!('amount')
+    end
+
+    params.must_equal original
+  end
+
+  it "only resolves shared callable dependencies once per request" do
+    params = typecast({'shared_value'=>'10', 'total'=>'0'}, @calls)
+
+    params.shared!('total').must_equal 20
+    @calls.must_equal [1]
+  end
+
+  it "raises before the request for unknown type dependencies" do
+    proc do
+      params_class do
+        handle_type(:bad, :depends_on=>:missing_type) {|v| v}
+      end.new({})
+    end.must_raise ProgrammerErrorClass
+  end
+
+  it "raises before the request for cyclic type dependencies" do
+    proc do
+      params_class do
+        handle_type(:cycle_a, :depends_on=>:cycle_b) {|v| v}
+        handle_type(:cycle_b, :depends_on=>:cycle_a) {|v| v}
+      end.new({})
+    end.must_raise ProgrammerErrorClass
+  end
+
 end
