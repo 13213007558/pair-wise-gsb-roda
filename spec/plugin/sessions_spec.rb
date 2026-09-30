@@ -2,6 +2,7 @@ require_relative "../spec_helper"
 require_relative "../../lib/roda/plugins/_base64"
 
 base64 = Roda::RodaPlugins::Base64_
+SHARD_PROBE_OFFSET = 20
 
 [true, false].each do |per_cookie_cipher_secret|
   describe "sessions plugin with per_cookie_cipher_secret: #{per_cookie_cipher_secret}" do 
@@ -502,4 +503,347 @@ base64 = Roda::RodaPlugins::Base64_
       [['{"a"=>"bar"}'], ['{"a" => "bar"}']].must_include b
     end
   end if Rack.release < '2.3'
+
+  describe "sessions plugin with :split_cookies" do
+    include CookieJar
+
+    def _req(app, env)
+      env['HTTP_COOKIE'] = jar_header unless jar_header.empty?
+      a = super
+      sync_cookie_jar(a[1])
+      @last_headers = a[1]
+      a
+    end
+
+    def last_set_cookie_lines(headers=nil)
+      Array((headers || @last_headers)[RodaResponseHeaders::SET_COOKIE]).flat_map{|h| h.split("\n")}
+    end
+
+    def req(path, opts={})
+      @errors ||= StringIO.new
+      super(path, opts.merge('rack.errors'=>@errors))
+    end
+
+    def errors
+      @errors.rewind
+      e = @errors.read.split("\n")
+      @errors.rewind
+      @errors.truncate(0)
+      e
+    end
+
+    # Parse Set-Cookie response headers into set cookies and expired cookie names.
+    def sync_cookie_jar(headers)
+      @jar ||= {}
+      Array(headers[RodaResponseHeaders::SET_COOKIE]).flat_map{|h| h.split("\n")}.each do |cookie|
+        name, rest = cookie.split('=', 2)
+        _, attrs = rest.split(';', 2)
+        if attrs && attrs =~ /max-age=0/i
+          @jar.delete(name)
+        else
+          @jar[name] = rest.split(';', 2).first
+        end
+      end
+    end
+
+    def jar_header
+      @jar.map{|name, value| "#{name}=#{value}"}.join('; ')
+    end
+
+    before do
+      @jar = {}
+      app(:bare) do
+        plugin :sessions, :secret=>'1'*64, :split_cookies=>true, :pad_size=>nil
+        route do |r|
+          r.get('s', String, String){|k, v| v.force_encoding('UTF-8'); session[k] = v}
+          r.get('g', String){|k| session[k].to_s}
+          r.get('sc'){session.clear; 'c'}
+          r.get('cs', String, String){|k, v| clear_session; session[k] = v}
+          r.get('len'){session['foo'].to_s.bytesize.to_s}
+          ''
+        end
+      end
+    end
+
+    # Find a value length that results in exactly the given number of shard cookies.
+    def value_length_for_shard_count(count)
+      probe = Class.new(Roda) do
+        plugin :sessions, :secret=>'1'*64, :split_cookies=>true, :pad_size=>nil
+        route do |r|
+          r.get('s', String, String){|k, v| v.force_encoding('BINARY'); session[k] = v}
+        end
+      end
+
+      low = 1
+      high = 10000
+      loop do
+        env = req_env('PATH_INFO'=>"/s/foo/#{'a'*high}")
+        _, headers, _ = probe.call(env)
+        lines = Array(headers[RodaResponseHeaders::SET_COOKIE]).flat_map{|h| h.split("\n")}
+        names = lines.map{|l| l.split('=', 2).first}
+        break if names.size >= count
+        low = high
+        high *= 2
+      end
+
+      while low < high
+        mid = (low + high) / 2
+        env = req_env('PATH_INFO'=>"/s/foo/#{'a'*mid}")
+        _, headers, _ = probe.call(env)
+        lines = Array(headers[RodaResponseHeaders::SET_COOKIE]).flat_map{|h| h.split("\n")}
+        names = lines.map{|l| l.split('=', 2).first}
+        if names.size < count
+          low = mid + 1
+        else
+          high = mid
+        end
+      end
+
+      # high is the first length producing at least count; scan forward a
+      # little to get a length safely in the middle of the count-shard range.
+      length = high
+      loop do
+        env = req_env('PATH_INFO'=>"/s/foo/#{'a'*(length + 200)}")
+        _, headers, _ = probe.call(env)
+        names = Array(headers[RodaResponseHeaders::SET_COOKIE]).flat_map{|h| h.split("\n")}.map{|l| l.split('=', 2).first}
+        break if names.size != count
+        length += 200
+      end
+      length
+    end
+
+    it "validates :max_cookie_chunks and :max_session_size options" do
+      proc{app(:bare){plugin :sessions, :secret=>'1'*64, :split_cookies=>true, :max_cookie_chunks=>1}}.must_raise Roda::RodaError
+      proc{app(:bare){plugin :sessions, :secret=>'1'*64, :split_cookies=>true, :max_cookie_chunks=>256}}.must_raise Roda::RodaError
+      proc{app(:bare){plugin :sessions, :secret=>'1'*64, :split_cookies=>true, :max_cookie_chunks=>'3'}}.must_raise Roda::RodaError
+      proc{app(:bare){plugin :sessions, :secret=>'1'*64, :split_cookies=>true, :max_session_size=>0}}.must_raise Roda::RodaError
+      proc{app(:bare){plugin :sessions, :secret=>'1'*64, :split_cookies=>true, :max_session_size=>'100'}}.must_raise Roda::RodaError
+    end
+
+    it "stores large sessions across multiple cookies and small sessions in a single cookie" do
+      _, headers, body = req('/s/foo/bar')
+      body.must_equal ['bar']
+      lines = last_set_cookie_lines(headers)
+      lines.size.must_equal 1
+      lines.first.must_match(/\Aroda\.session=/)
+      body('/g/foo').must_equal 'bar'
+      errors.must_equal []
+
+      two = value_length_for_shard_count(2)
+      _, headers, body = req("/s/foo/#{'a' * two}")
+      lines = last_set_cookie_lines(headers)
+      lines = lines.reject{|l| l =~ /max-age=0/i}
+      names = lines.map{|l| l.split('=', 2).first}.sort
+      names.must_equal ['roda.session.0', 'roda.session.1']
+      lines.each{|line| line.bytesize.must_be :<, 4096}
+      body('/len').must_equal two.to_s
+      errors.must_equal []
+    end
+
+    it "uses the same cookie options for every shard and each shard stays under 4096 bytes" do
+      @app.plugin(:sessions, :cookie_options=>{:domain=>'example.com', :same_site=>:strict})
+      length = value_length_for_shard_count(3)
+      _, headers, _ = req("/s/foo/#{'b'*length}")
+      lines = last_set_cookie_lines(headers)
+      lines.size.must_be :>=, 3
+      lines.each do |line|
+        line.must_match(/domain=example\.com/i)
+        line.must_match(/samesite=strict/i)
+        line.must_match(/path=\//i)
+        line.must_match(/httponly/i)
+        line.bytesize.must_be :<, 4096
+      end
+      lines.map{|l| l.split(';', 2).last}.uniq.size.must_equal 1
+    end
+
+    it "keeps supporting existing single-cookie sessions" do
+      single = Class.new(Roda) do
+        plugin :sessions, :secret=>'1'*64
+        route do |r|
+          r.get('s', String, String){|k, v| session[k] = v}
+          r.get('g', String){|k| session[k].to_s}
+        end
+      end
+
+      env = req_env('PATH_INFO'=>'/s/foo/bar')
+      _, headers, _ = single.call(env)
+      line = Array(headers[RodaResponseHeaders::SET_COOKIE]).flat_map{|h| h.split("\n")}.first
+      @jar = {}
+      name, rest = line.split('=', 2)
+      @jar[name] = rest.split(';', 2).first
+
+      body('/g/foo').must_equal 'bar'
+      errors.must_equal []
+    end
+
+    it "expires an old single-cookie value when submitted alongside valid shards" do
+      # First create a valid shard set in the normal jar.
+      length = value_length_for_shard_count(2)
+      req("/s/foo/#{'p'*length}")
+      shard_jar = @jar.dup
+
+      # Also create a legacy single cookie with a different app using the same key.
+      single = Class.new(Roda) do
+        plugin :sessions, :secret=>'1'*64
+        route do |r|
+          r.get('s', String, String){|k, v| session[k] = v}
+        end
+      end
+      env = req_env('PATH_INFO'=>'/s/old/value')
+      _, headers, _ = single.call(env)
+      line = Array(headers[RodaResponseHeaders::SET_COOKIE]).flat_map{|h| h.split("\n")}.first
+      name, rest = line.split('=', 2)
+      shard_jar[name] = rest.split(';', 2).first
+
+      @jar = shard_jar
+      _, headers, _ = req('/s/foo/bar')
+      lines = last_set_cookie_lines(headers)
+      # Shards win on read; the rewrite is a single small cookie replacing the
+      # legacy base value, and the leftover shard cookies are expired.
+      written = lines.reject{|l| l =~ /max-age=0/i}.map{|l| l.split('=', 2).first}
+      expired = lines.select{|l| l =~ /max-age=0/i}.map{|l| l.split('=', 2).first}
+      written.must_equal ['roda.session']
+      expired.sort.must_equal ['roda.session.0', 'roda.session.1']
+      body('/g/foo').must_equal 'bar'
+    end
+
+    it "expires a legacy base cookie when valid shards are submitted and the session is cleared" do
+      length = value_length_for_shard_count(2)
+      req("/s/foo/#{'p'*length}")
+      shard_jar = @jar.dup
+      @jar['roda.session'] = 'legacy'
+
+      _, headers, _ = req('/sc')
+      lines = last_set_cookie_lines(headers)
+      expired = lines.map{|l| l.split('=', 2).first}.sort
+      expired.must_equal ['roda.session', 'roda.session.0', 'roda.session.1']
+    end
+
+    it "does not accept a shard set missing a shard, and cleans up the leftover shards on the next write" do
+      length = value_length_for_shard_count(2)
+      req("/s/foo/#{'c'*length}")
+      @jar.delete('roda.session.1')
+
+      body('/g/foo').must_equal ''
+      errors.must_equal ["Not decoding session: expected 2 session shards, received 1"]
+
+      _, headers, body = req('/s/bar/value')
+      lines = last_set_cookie_lines(headers)
+      expired = lines.select{|l| l =~ /max-age=0/i}.map{|l| l.split('=', 2).first}
+      expired.must_include 'roda.session.0'
+      body.must_equal ['value']
+      body('/g/bar').must_equal 'value'
+    end
+
+    it "does not accept duplicate shard numbers" do
+      length = value_length_for_shard_count(3)
+      req("/s/foo/#{'d'*length}")
+      @jar['roda.session.2'] = @jar['roda.session.1']
+
+      body('/g/foo').must_equal ''
+      errors.first.must_include 'does not match cookie name index'
+    end
+
+    it "does not accept shards mixed from different writes" do
+      length = value_length_for_shard_count(2)
+      req("/s/foo/#{'e'*length}")
+      first = @jar.dup
+      req("/s/foo/#{'f'*length}")
+      @jar['roda.session.1'] = first['roda.session.1']
+
+      body('/g/foo').must_equal ''
+      errors.first.must_include 'different writes'
+    end
+
+    it "rejects shards that do not form an intact, HMAC-valid session" do
+      length = value_length_for_shard_count(2)
+      req("/s/foo/#{'g'*length}")
+      value = @jar['roda.session.0']
+      shard = Roda::RodaPlugins::Base64_.urlsafe_decode64(value)
+      # Flip a byte in the shard data portion (after the 11 byte shard header)
+      shard.setbyte(SHARD_PROBE_OFFSET, shard.getbyte(SHARD_PROBE_OFFSET) ^ 0xff)
+      @jar['roda.session.0'] = Roda::RodaPlugins::Base64_.urlsafe_encode64(shard)
+
+      body('/g/foo').must_equal ''
+      errors.first.must_include 'HMAC invalid'
+    end
+
+    it "expires extra shards when shrinking from five shards to two" do
+      five = value_length_for_shard_count(5)
+      _, headers, _ = req("/s/foo/#{'h'*five}")
+      five_lines = last_set_cookie_lines(headers)
+      five_lines.size.must_equal 5
+      old_names = five_lines.map{|l| l.split('=', 2).first}.sort
+      old_names.must_equal (0...5).map{|i| "roda.session.#{i}"}
+      body('/len').must_equal five.to_s
+
+      two = value_length_for_shard_count(2)
+      old_jar = @jar.dup
+      _, headers, _ = req("/s/foo/#{'i'*two}")
+      lines = last_set_cookie_lines(headers)
+      set = lines.reject{|l| l =~ /max-age=0/i}
+      expired = lines.select{|l| l =~ /max-age=0/i}.map{|l| l.split('=', 2).first}.sort
+      set_names = set.map{|l| l.split('=', 2).first}.sort
+      set_names.must_equal ['roda.session.0', 'roda.session.1']
+      expired.must_equal ['roda.session.2', 'roda.session.3', 'roda.session.4']
+      set.each{|l| l.bytesize.must_be :<, 4096}
+
+      # Update the jar to the post-shrink response first.
+      sync_cookie_jar(headers)
+      new_jar = @jar.dup
+
+      # The stale shards alone cannot restore a partial session.
+      @jar = old_jar.select{|name, _| ['roda.session.2', 'roda.session.3', 'roda.session.4'].include?(name)}
+      body('/g/foo').must_equal ''
+      errors.wont_be :empty?
+
+      # The new two-shard session is intact.
+      @jar = new_jar
+      body('/len').must_equal two.to_s
+      errors.must_equal []
+    end
+
+    it "expires all shards when the session is cleared with clear_session or session.clear" do
+      length = value_length_for_shard_count(3)
+      req("/s/foo/#{'j'*length}")
+      @jar.keys.size.must_equal 3
+
+      _, headers, _ = req('/sc')
+      lines = last_set_cookie_lines(headers)
+      expired = lines.map{|l| l.split('=', 2).first}.sort
+      expired.must_equal ['roda.session.0', 'roda.session.1', 'roda.session.2']
+      @jar.must_equal({})
+
+      req("/s/foo/#{'k'*length}")
+      _, headers, _ = req('/cs/bar/baz')
+      lines = last_set_cookie_lines(headers)
+      expired = lines.select{|l| l =~ /max-age=0/i}.map{|l| l.split('=', 2).first}.sort
+      expired.must_equal ['roda.session.0', 'roda.session.1', 'roda.session.2']
+    end
+
+    it "expires submitted shards when the session has expired" do
+      length = value_length_for_shard_count(2)
+      req("/s/foo/#{'l'*length}")
+      @app.plugin(:sessions, :max_idle_seconds=>-1)
+
+      _, headers, _ = req('/g/foo')
+      lines = last_set_cookie_lines(headers)
+      expired = lines.map{|l| l.split('=', 2).first}.sort
+      expired.must_equal ['roda.session.0', 'roda.session.1']
+      errors.must_equal ["Not returning session: maximum session idle time expired"]
+    end
+
+    it "raises CookieTooLarge when exceeding the chunk or total size limits" do
+      @app.plugin(:sessions, :max_cookie_chunks=>2)
+      proc{req("/s/foo/#{'m'*12000}")}.must_raise Roda::RodaPlugins::Sessions::CookieTooLarge
+
+      app(:bare) do
+        plugin :sessions, :secret=>'1'*64, :split_cookies=>true, :pad_size=>nil, :max_session_size=>1000
+        route do |r|
+          r.get('s', String, String){|k, v| session[k] = v}
+        end
+      end
+      proc{req("/s/foo/#{'n'*6000}")}.must_raise Roda::RodaPlugins::Sessions::CookieTooLarge
+    end
+  end
 end

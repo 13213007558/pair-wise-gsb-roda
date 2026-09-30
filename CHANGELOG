@@ -1,5 +1,7 @@
 === master
 
+* Add :split_cookies option to sessions plugin, storing oversized sessions across multiple cookie shards with manifest, shard number, write nonce, and reassembled HMAC checks, with :max_cookie_chunks and :max_session_size limits; expire stale shards when sessions shrink, are cleared, or expire (jeremyevans)
+
 * Persist keys set in Roda.opts to class instance variables, add attr_reader methods for much faster access (jeremyevans)
 
 * Add rescue_classes keyword argument to invalid_request_body plugin (jeremyevans)

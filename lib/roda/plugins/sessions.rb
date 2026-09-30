@@ -46,7 +46,9 @@ class Roda
     # and remove support for them once old sessions have converted or timed out.
     #
     # If the final cookie is too large (>=4096 bytes), a Roda::RodaPlugins::Sessions::CookieTooLarge
-    # exception will be raised.
+    # exception will be raised.  If the session is too large to fit in a single cookie, the
+    # +:split_cookies+ option can be enabled to store the encrypted session across multiple
+    # cookies (shards), see the option description below.
     #
     # = Required Options
     #
@@ -88,6 +90,24 @@ class Roda
     #                              generator could make the odds much higher.  Default is +true+.
     # :parser :: The parser for the serialized session data (default: <tt>JSON.method(:parse)</tt>).
     # :serializer :: The serializer for the session data (default +:to_json.to_proc+).
+    # :split_cookies :: Whether to allow storing a single session across multiple cookies when it is too
+    #                   large for one cookie (default: +false+).  When enabled, sessions that fit in a
+    #                   single cookie continue to use the single cookie format described below.  When the
+    #                   session is too large, it is encrypted and signed as a whole, then split into
+    #                   multiple cookies named <tt><key>.0</tt>, <tt><key>.1</tt>, ..., each set with the
+    #                   same +:cookie_options+.  On decode, the shard manifest (number of shards), shard
+    #                   numbers, and the HMAC of the reassembled data are checked, so shards from
+    #                   different writes or missing/duplicate shards cannot be used to restore a partial
+    #                   session.  When the session shrinks back to fit in fewer cookies, or
+    #                   +clear_session+ is used, or the submitted session has expired, the extra stale
+    #                   shard cookies are expired.  Existing single-cookie sessions remain supported.
+    # :max_cookie_chunks :: The maximum number of cookie shards allowed for a session when +:split_cookies+
+    #                       is enabled (default: 10).  Must be an Integer from 2 to 255.
+    # :max_session_size :: The maximum allowed size of the encoded session data in bytes, used when
+    #                      +:split_cookies+ is enabled (default: 40960).  Note that regardless of this
+    #                      setting, each cookie still must be under the 4096 byte per-cookie limit, and
+    #                      exceeding this limit or the +:max_cookie_chunks+ limit raises
+    #                      Roda::RodaPlugins::Sessions::CookieTooLarge.  Must be a positive Integer.
     # :skip_within :: If the last update time for the session cookie is less than this number of seconds from the
     #                 current time, and the session has not been modified, do not set a new session cookie
     #                 (default: 3600).
@@ -147,9 +167,26 @@ class Roda
     # padding :: >=0 padding bytes specified in bitmap, filled with random data, can be ignored.
     # serialized data :: >=2 bytes of serialized data in JSON format.  If the bitmap indicates
     #                    deflate compression, this contains the deflate compressed data.
+    #
+    # When +:split_cookies+ is enabled and the full cookie value above is too large for a single
+    # cookie, the binary data (before the outer base64 encoding) is split into shards.  Each shard
+    # cookie value uses the following format:
+    #
+    #   urlsafe_base64("\2" + nonce + total_shards + shard_number + shard_data)
+    #
+    # where:
+    #
+    # version :: 1 byte, 2 for cookie shards.
+    # nonce :: 8 bytes of random data, same for all shards of a single write, different per write.
+    # total_shards :: 1 byte unsigned, total number of shards for the write.
+    # shard_number :: 1 byte unsigned, 0-based index of this shard.
+    # shard_data :: a non-empty slice of the single-cookie binary data, in shard_number order.
+    #
+    # Because the shard data reassembles into the single-cookie binary format, its trailing HMAC
+    # authenticates the full reassembled session.
     module Sessions
       DEFAULT_COOKIE_OPTIONS = {:httponly=>true, :path=>'/'.freeze, :same_site=>:lax}.freeze
-      DEFAULT_OPTIONS = {:key => 'roda.session'.freeze, :max_seconds=>86400*30, :max_idle_seconds=>86400*7, :pad_size=>32, :gzip_over=>nil, :skip_within=>3600, :env_key=>'rack.session'}.freeze
+      DEFAULT_OPTIONS = {:key => 'roda.session'.freeze, :max_seconds=>86400*30, :max_idle_seconds=>86400*7, :pad_size=>32, :gzip_over=>nil, :skip_within=>3600, :env_key=>'rack.session', :split_cookies=>false, :max_cookie_chunks=>10, :max_session_size=>40960}.freeze
       DEFLATE_BIT  = 0x1000
       PADDING_MASK = 0x0fff
       SESSION_CREATED_AT = 'roda.session.created_at'.freeze
@@ -157,6 +194,9 @@ class Roda
       SESSION_SERIALIZED = 'roda.session.serialized'.freeze
       SESSION_VERSION_NUM = 'roda.session.version'.freeze
       SESSION_DELETE_RACK_COOKIE = 'roda.session.delete_rack_session_cookie'.freeze
+      SESSION_SUBMITTED_KEYS = 'roda.session.submitted_keys'.freeze
+      SHARD_VERSION = 2
+      SHARD_HEADER_SIZE = 11
 
       # Exception class used when creating a session cookie that would exceed the
       # allowable cookie size limit.
@@ -210,6 +250,20 @@ class Roda
           raise RodaError, "invalid :pad_size: #{opts[:pad_size]}, must be >=2, < 4096" unless opts[:pad_size] >= 2 && opts[:pad_size] < 4096
         else
           raise RodaError, "invalid :pad_size option: #{opts[:pad_size].inspect}, must be Integer or nil"
+        end
+        
+        case opts[:max_cookie_chunks]
+        when Integer
+          raise RodaError, "invalid :max_cookie_chunks: #{opts[:max_cookie_chunks]}, must be >=2, < 256" unless opts[:max_cookie_chunks] >= 2 && opts[:max_cookie_chunks] <= 255
+        else
+          raise RodaError, "invalid :max_cookie_chunks option: #{opts[:max_cookie_chunks].inspect}, must be Integer"
+        end
+
+        case opts[:max_session_size]
+        when Integer
+          raise RodaError, "invalid :max_session_size: #{opts[:max_session_size]}, must be > 0" unless opts[:max_session_size] > 0
+        else
+          raise RodaError, "invalid :max_session_size option: #{opts[:max_session_size].inspect}, must be Integer"
         end
         
         app.opts[:sessions] = opts.freeze
@@ -271,42 +325,26 @@ class Roda
         # sent in the future.
         def persist_session(headers, session)
           opts = roda_class.sessions_opts
+          key = opts[:key]
+          submitted_keys = env[SESSION_SUBMITTED_KEYS]
 
           if session.empty?
-            if env[SESSION_SERIALIZED]
-              # If session was submitted and is now empty, remove the cookie
-              Rack::Utils.delete_cookie_header!(headers, opts[:key], opts[:remove_cookie_options])
+            # If the session was submitted and is now empty, remove all
+            # submitted session cookies.  For sharded sessions, this also
+            # expires incomplete or otherwise invalid shards (e.g. expired
+            # or from a mismatched write), so stale shard data cannot be
+            # left in use.
+            if submitted_keys
+              _delete_session_cookies(headers, submitted_keys)
+            elsif env[SESSION_SERIALIZED]
+              Rack::Utils.delete_cookie_header!(headers, key, opts[:remove_cookie_options])
             # else
               # If no session was submitted, and the session is empty
               # then there is no need to do anything
             end
-          elsif cookie_value = _serialize_session(session)
-            cookie = Hash[opts[:cookie_options]]
-            cookie[:value] = cookie_value
-            cookie[:secure] = true if !cookie.has_key?(:secure) && ssl?
-
-            before_size = if (set_cookie_before = headers[RodaResponseHeaders::SET_COOKIE]).is_a?(String)
-              set_cookie_before.bytesize
-            else
-              0
-            end
-
-            Rack::Utils.set_cookie_header!(headers, opts[:key], cookie)
-
-            cookie_size = case set_cookie_after = headers[RodaResponseHeaders::SET_COOKIE]
-            when String
-              # Rack < 3 always takes this branch, combines cookies into string, subtract previous size
-              # Rack 3+ takes this branch if this is the first cookie set, in which case before size is 0
-              set_cookie_after.bytesize - before_size
-            else # when Array
-              # Rack 3+ takes branch if this is not the first cookie set, and last element of the array
-              # is most recently added cookie
-              set_cookie_after.last.bytesize
-            end
-
-            if cookie_size >= 4096
-              raise CookieTooLarge, "attempted to create cookie larger than 4096 bytes (bytes: #{cookie_size})"
-            end
+          elsif session_data = _serialize_session(session)
+            written_keys = _write_session_cookies(headers, session_data)
+            _delete_unsubmitted_session_cookies(headers, submitted_keys, written_keys) if submitted_keys
           end
           
           if env[SESSION_DELETE_RACK_COOKIE]
@@ -324,9 +362,42 @@ class Roda
           opts = roda_class.sessions_opts
           cs = cookies
 
-          if data = cs[opts[:key]]
-            _deserialize_session(data)
-          elsif (key = opts[:upgrade_from_rack_session_cookie_key]) && (data = cs[key])
+          key = opts[:key]
+          submitted_keys = nil
+
+          if opts[:split_cookies]
+            prefix = key + '.'
+            shard_values = []
+            cs.each do |cookie_key, value|
+              next unless cookie_key.start_with?(prefix)
+              suffix = cookie_key.slice(prefix.bytesize, cookie_key.bytesize)
+              next unless suffix =~ /\A\d+\z/
+              index = suffix.to_i
+              next unless index < 256
+              (submitted_keys ||= []) << cookie_key
+              shard_values << [index, value]
+            end
+
+            unless shard_values.empty?
+              # Track the single-cookie name as well when it is also submitted,
+              # so a later write or clear expires it instead of leaving the old
+              # single-cookie value in the browser alongside the shards.
+              (submitted_keys ||= []) << key if cs.key?(key) && !submitted_keys.include?(key)
+              if data = _deserialize_session_shards(shard_values)
+                env[SESSION_SUBMITTED_KEYS] = submitted_keys
+                return data
+              end
+              env[SESSION_SUBMITTED_KEYS] = submitted_keys
+              return {}
+            end
+          end
+
+          if data = cs[key]
+            if session = _deserialize_session(data)
+              env[SESSION_SUBMITTED_KEYS] = [key]
+              session
+            end
+          elsif (upgrade_key = opts[:upgrade_from_rack_session_cookie_key]) && (data = cs[upgrade_key])
             _deserialize_rack_session(data)
           end || {}
         end
@@ -385,6 +456,70 @@ class Roda
           rescue ArgumentError
             return _session_serialization_error("Unable to decode session: invalid base64")
           end
+
+          _deserialize_session_binary(data)
+        end
+
+        # Reassemble the shard cookie values into the single-cookie binary
+        # session data, checking the shard manifest, shard numbers, and that
+        # all shards come from the same write.  Integrity of the reassembled
+        # data is checked by _deserialize_session_binary (HMAC).
+        def _deserialize_session_shards(shard_values)
+          opts = roda_class.sessions_opts
+
+          shards = []
+          shard_values.each do |index, value|
+            begin
+              shard = Base64_.urlsafe_decode64(value)
+            rescue ArgumentError
+              return _session_serialization_error("Unable to decode session shard #{index}: invalid base64")
+            end
+
+            unless shard.bytesize > SHARD_HEADER_SIZE && shard.getbyte(0) == SHARD_VERSION
+              return _session_serialization_error("Unable to decode session shard #{index}: invalid shard format")
+            end
+
+            _, nonce, total_shards, shard_number = shard.unpack('Ca8CC')
+            unless shard_number == index
+              return _session_serialization_error("Not decoding session: shard number #{shard_number} does not match cookie name index #{index}")
+            end
+            unless total_shards >= 2 && total_shards <= opts[:max_cookie_chunks]
+              return _session_serialization_error("Not decoding session: invalid shard count #{total_shards}")
+            end
+            if shard_expected_total = shards.first&.at(1)
+              unless shard_expected_total == total_shards
+                return _session_serialization_error("Not decoding session: submitted shards have inconsistent shard counts")
+              end
+            end
+
+            shards << [nonce, total_shards, shard_number, shard.byteslice(SHARD_HEADER_SIZE, shard.bytesize)]
+          end
+
+          total_shards = shards.first[1]
+          nonce = shards.first[0]
+
+          unless shards.length == total_shards
+            return _session_serialization_error("Not decoding session: expected #{total_shards} session shards, received #{shards.length}")
+          end
+          # Shard numbers were checked to match their cookie names, so unique
+          # names mean unique numbers; sorting puts them in shard_number order.
+          shards.sort_by!{|_, _, shard_number, _| shard_number}
+          unless shards.each_with_index.all?{|(_, _, shard_number, _), expected_index| shard_number == expected_index}
+            return _session_serialization_error("Not decoding session: non-sequential session shard numbers")
+          end
+          unless shards.all?{|shard| shard[0] == nonce && shard[1] == total_shards}
+            return _session_serialization_error("Not decoding session: submitted shards come from different writes")
+          end
+
+          data = String.new
+          shards.each{|_, _, _, shard_data| data << shard_data}
+          _deserialize_session_binary(data)
+        end
+
+        # Decrypt and verify the single-cookie binary session data
+        # (also used for the data reassembled from cookie shards).
+        def _deserialize_session_binary(data)
+          opts = roda_class.sessions_opts
 
           case version = data.getbyte(0)
           when 1
@@ -530,13 +665,132 @@ class Roda
           data << encrypted_data
           data << OpenSSL::HMAC.digest(OpenSSL::Digest::SHA256.new, opts[:hmac_secret], data+opts[:key])
 
-          data = Base64_.urlsafe_encode64(data)
+          data
+        end
 
-          if data.bytesize >= 4096
-            raise CookieTooLarge, "attempted to create cookie larger than 4096 bytes (bytes: #{data.bytesize})"
+        # Write the binary session data as a single cookie or multiple shard
+        # cookies, all with the same cookie options.  Returns the cookie names
+        # written for the session.
+        def _write_session_cookies(headers, session_data)
+          opts = roda_class.sessions_opts
+          key = opts[:key]
+
+          cookie = Hash[opts[:cookie_options]]
+          cookie[:secure] = true if !cookie.has_key?(:secure) && ssl?
+
+          if !opts[:split_cookies] || _session_cookie_fits?(cookie, session_data)
+            cookie[:value] = Base64_.urlsafe_encode64(session_data)
+            _set_session_cookie(headers, key, cookie)
+            return [key]
           end
 
-          data
+          encoded_size = Base64_.urlsafe_encode64(session_data).bytesize
+          if encoded_size > opts[:max_session_size]
+            raise CookieTooLarge, "attempted to create session larger than #{opts[:max_session_size]} bytes (bytes: #{encoded_size})"
+          end
+
+          unless shard_count = _shard_count_for_session(cookie, session_data)
+            raise CookieTooLarge, "attempted to create session that cannot fit in #{opts[:max_cookie_chunks]} cookies under the 4096 byte per-cookie limit"
+          end
+
+          nonce = SecureRandom.random_bytes(8)
+          chunk_size = (session_data.bytesize / shard_count.to_f).ceil
+          written_keys = []
+
+          shard_count.times do |index|
+            shard_data = session_data.byteslice(index*chunk_size, chunk_size)
+            shard = String.new
+            shard << SHARD_VERSION
+            shard << nonce
+            shard << shard_count
+            shard << index
+            shard << shard_data
+
+            cookie[:value] = Base64_.urlsafe_encode64(shard)
+            cookie_key = "#{key}.#{index}"
+            _set_session_cookie(headers, cookie_key, cookie)
+            written_keys << cookie_key
+          end
+
+          written_keys
+        end
+
+        # Set the session cookie and enforce the 4096 byte per-cookie limit
+        # based on the size of the Set-Cookie header actually produced.
+        def _set_session_cookie(headers, key, cookie)
+          before_size = if (set_cookie_before = headers[RodaResponseHeaders::SET_COOKIE]).is_a?(String)
+            set_cookie_before.bytesize
+          else
+            0
+          end
+
+          Rack::Utils.set_cookie_header!(headers, key, cookie)
+
+          cookie_size = case set_cookie_after = headers[RodaResponseHeaders::SET_COOKIE]
+          when String
+            # Rack < 3 always takes this branch, combines cookies into string, subtract previous size
+            # Rack 3+ takes this branch if this is the first cookie set, in which case before size is 0
+            set_cookie_after.bytesize - before_size
+          else # when Array
+            # Rack 3+ takes branch if this is not the first cookie set, and last element of the array
+            # is most recently added cookie
+            set_cookie_after.last.bytesize
+          end
+
+          if cookie_size >= 4096
+            raise CookieTooLarge, "attempted to create cookie larger than 4096 bytes (bytes: #{cookie_size})"
+          end
+        end
+
+        # Check whether the binary session data can be stored as a single
+        # cookie under the 4096 byte per-cookie limit, without modifying the
+        # response headers.
+        def _session_cookie_fits?(cookie, session_data)
+          single_cookie = cookie.merge(:value=>Base64_.urlsafe_encode64(session_data))
+          Rack::Utils.set_cookie_header(roda_class.sessions_opts[:key], single_cookie).bytesize < 4096
+        end
+
+        # Find the smallest number of shards (from 2 to the configured maximum)
+        # where every resulting cookie header is under 4096 bytes.
+        def _shard_count_for_session(cookie, session_data)
+          opts = roda_class.sessions_opts
+          key = opts[:key]
+          nonce = "\0" * 8
+
+          (2..opts[:max_cookie_chunks]).each do |shard_count|
+            chunk_size = (session_data.bytesize / shard_count.to_f).ceil
+            next if shard_count > session_data.bytesize
+            fits = shard_count.times.all? do |index|
+              shard = String.new
+              shard << SHARD_VERSION
+              shard << nonce
+              shard << shard_count
+              shard << index
+              shard << session_data.byteslice(index*chunk_size, chunk_size)
+              probe = cookie.merge(:value=>Base64_.urlsafe_encode64(shard))
+              Rack::Utils.set_cookie_header("#{key}.#{index}", probe).bytesize < 4096
+            end
+            return shard_count if fits
+          end
+
+          nil
+        end
+
+        # Expire the given session cookie names using the removal cookie
+        # options, so the browser deletes them.
+        def _delete_session_cookies(headers, keys)
+          opts = roda_class.sessions_opts
+          keys.each do |key|
+            Rack::Utils.delete_cookie_header!(headers, key, opts[:remove_cookie_options])
+          end
+        end
+
+        # Expire submitted session cookies that are not part of the session
+        # cookies just written (e.g. stale shards left after the session
+        # shrank, or the old single cookie replaced by shards).
+        def _delete_unsubmitted_session_cookies(headers, submitted_keys, written_keys)
+          stale_keys = submitted_keys - written_keys
+          _delete_session_cookies(headers, stale_keys) unless stale_keys.empty?
         end
       end
     end

@@ -121,4 +121,57 @@ describe "RodaSessionMiddleware" do
     sess.keys.must_equal ["foo"]
     sess.values.must_equal ["bar"]
   end
+
+  it "supports sharded sessions with :split_cookies" do
+  app(:bare) do
+    use RodaSessionMiddleware, :secret=>'1'*64, :split_cookies=>true, :pad_size=>nil
+
+    route do |r|
+      r.get('s', String, String){|k, v| v.force_encoding('BINARY'); session[k] = v}
+      r.get('g', String){|k| session[k].to_s}
+    end
+  end
+
+  length = nil
+  probe = Class.new(Roda) do
+    plugin :sessions, :secret=>'1'*64, :split_cookies=>true, :pad_size=>nil
+    route do |r|
+      r.get('s', String, String){|k, v| session[k] = v}
+    end
+  end
+  low = 1
+  high = 10000
+  loop do
+    env = {"REQUEST_METHOD"=>"GET","PATH_INFO"=>"/s/foo/#{'a'*high}","SCRIPT_NAME"=>"","QUERY_STRING"=>"","rack.input"=>StringIO.new,"rack.errors"=>StringIO.new}
+    _, headers, _ = probe.call(env)
+    names = Array(headers[RodaResponseHeaders::SET_COOKIE]).flat_map{|h| h.split("\n")}.map{|l| l.split('=',2).first}
+    break if names.size >= 2
+    high *= 2
+  end
+  while low < high
+    mid = (low+high)/2
+    env = {"REQUEST_METHOD"=>"GET","PATH_INFO"=>"/s/foo/#{'a'*mid}","SCRIPT_NAME"=>"","QUERY_STRING"=>"","rack.input"=>StringIO.new,"rack.errors"=>StringIO.new}
+    _, headers, _ = probe.call(env)
+    names = Array(headers[RodaResponseHeaders::SET_COOKIE]).flat_map{|h| h.split("\n")}.map{|l| l.split('=',2).first}
+    if names.size < 2
+      low = mid+1
+    else
+      high = mid
+    end
+  end
+  length = low + 200
+
+  value = 'a'*length
+  env = req_env('PATH_INFO'=>"/s/foo/#{value}")
+  _, headers, b = @app.call(env)
+  lines = Array(headers[RodaResponseHeaders::SET_COOKIE]).flat_map{|h| h.split("\n")}
+  lines.size.must_be :>=, 2
+  lines.each{|l| l.must_match(/\Aroda\.session\.\d=/); l.bytesize.must_be :<, 4096}
+  b.first.bytesize.must_equal value.bytesize
+
+  cookie_header = lines.map{|l| l.split(';', 2).first}.join('; ')
+  env = req_env('PATH_INFO'=>'/g/foo', 'HTTP_COOKIE'=>cookie_header)
+  _, _, body = @app.call(env)
+  body.first.b.must_equal value.dup.force_encoding('BINARY')
+end
 end
