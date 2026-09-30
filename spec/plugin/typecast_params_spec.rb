@@ -848,6 +848,160 @@ describe "typecast_params plugin" do
     end.must_equal("x"=>nil, "y"=>nil, "c"=>{"x"=>nil, "z"=>nil})
   end
 
+  it "#convert! should resolve declared dependencies in declaration-independent order" do
+    app.plugin :typecast_params do
+      handle_type(:end_at, dependencies: {timezone: :str}) do |value, deps|
+        [value, deps[:timezone]]
+      end
+    end
+
+    tp('end_at=2026-01-01&timezone=Asia/Shanghai').convert! do |tp|
+      tp.end_at!('end_at')
+    end.must_equal('end_at'=>['2026-01-01', 'Asia/Shanghai'])
+
+    tp('timezone=Asia/Shanghai&end_at=2026-01-01').convert! do |tp|
+      tp.end_at!('end_at')
+    end.must_equal('end_at'=>['2026-01-01', 'Asia/Shanghai'])
+  end
+
+  it "#convert! should resolve relative dependencies in nested objects and array members" do
+    app.plugin :typecast_params do
+      handle_type(:end_at, dependencies: {timezone: :str}) do |value, deps|
+        [value, deps[:timezone]]
+      end
+
+      handle_type(:money, dependencies: {currency: :str}) do |value, deps|
+        [::Kernel::Integer(value), deps[:currency]]
+      end
+    end
+
+    result = tp('event'=>{'end_at'=>'2026-01-01', 'timezone'=>'UTC'}, 'items'=>[{'amount'=>'1', 'currency'=>'USD'}, {'amount'=>'2', 'currency'=>'EUR'}]).convert! do |tp|
+      tp['event'].convert! do |event|
+        event.end_at!('end_at')
+      end
+      tp['items'].convert_each! do |item|
+        item.money!('amount')
+      end
+    end
+    result.must_equal('event'=>{'end_at'=>['2026-01-01', 'UTC']}, 'items'=>[{'amount'=>[1, 'USD']}, {'amount'=>[2, 'EUR']}])
+  end
+
+  it "#convert! should block dependent array members when a dependency fails" do
+    app.plugin :typecast_params do
+      handle_type(:array_money, dependencies: {currency: :str}) do |value, deps|
+        [::Kernel::Integer(value.fetch('amount')), deps[:currency]]
+      end
+    end
+
+    e = error do
+      tp('items'=>[{'amount'=>'1'}]).convert! do |tp|
+        tp.array(:array_money, 'items')
+      end
+    end
+
+    e.param_names.must_equal ['items[][currency]', 'items[]']
+    e.all_errors.map(&:reason).must_equal [:missing, :blocked]
+  end
+
+  it "#convert! should block downstream defaults and collect unrelated errors" do
+    app.plugin :typecast_params do
+      handle_type(:end_at, dependencies: {timezone: :str}) do |value, deps|
+        [value, deps[:timezone]]
+      end
+    end
+
+    e = error do
+      tp('end_at=2026-01-01&other=bad').convert! do |tp|
+        tp.end_at('end_at', 'default')
+        tp.Integer!('other')
+      end
+    end
+
+    e.param_names.must_equal ['timezone', 'end_at', 'other']
+    e.all_errors.map(&:reason).must_equal [:missing, :blocked, :Integer]
+    e.all_errors.map(&:keys).must_equal [['timezone'], ['end_at'], ['other']]
+  end
+
+  it "should memoize a side-effecting conversion once per request" do
+    app.plugin :typecast_params do
+      handle_type(:shared_timezone) do |value|
+        $dependency_conversion_count += 1
+        value
+      end
+
+      handle_type(:shared_end_at, dependencies: {timezone: :shared_timezone}) do |value, deps|
+        [value, deps[:timezone]]
+      end
+    end
+
+    $dependency_conversion_count = 0
+    params = tp('timezone=UTC&end_at=2026-01-01')
+    result = params.convert! do |tp|
+      tp.shared_end_at!('end_at')
+      tp.shared_timezone('timezone')
+    end
+
+    result.must_equal('end_at'=>['2026-01-01', 'UTC'], 'timezone'=>'UTC')
+    $dependency_conversion_count.must_equal 1
+
+    $dependency_conversion_count = 0
+    params = tp('values[]=1&values[]=2')
+    params.convert! do |tp|
+      tp.array(:shared_timezone, 'values')
+      tp.array(:shared_timezone, 'values')
+    end
+    $dependency_conversion_count.must_equal 2
+  end
+
+  it "should not convert dependencies when the dependent parameter is absent" do
+    app.plugin :typecast_params do
+      handle_type(:optional_timezone) do |value|
+        $optional_dependency_conversion_count += 1
+        value
+      end
+
+      handle_type(:optional_end_at, dependencies: {timezone: :optional_timezone}) do |value, deps|
+        [value, deps[:timezone]]
+      end
+    end
+
+    $optional_dependency_conversion_count = 0
+    tp('timezone=UTC').convert! do |tp|
+      tp.optional_end_at('end_at', 'default').must_equal 'default'
+    end
+    $optional_dependency_conversion_count.must_equal 0
+  end
+
+  it "should not mutate original array params during conversion" do
+    params = {'items'=>['1', '2']}
+    converted = tp(params).convert! do |tp|
+      tp.array!(:int, 'items')
+    end
+
+    converted.must_equal('items'=>[1, 2])
+    params.must_equal('items'=>['1', '2'])
+  end
+
+  it "should reject unknown dependency types before processing requests" do
+    lambda do
+      app.plugin :typecast_params do
+        handle_type(:bad, dependencies: {timezone: :unknown_type}) do |value, deps|
+        end
+      end
+    end.must_raise Roda::RodaPlugins::TypecastParams::ProgrammerError
+  end
+
+  it "should reject dependency cycles before processing requests" do
+    lambda do
+      app.plugin :typecast_params do
+        handle_type(:cycle_one, dependencies: [:cycle_two]) do |value, deps|
+        end
+        handle_type(:cycle_two, dependencies: [:cycle_one]) do |value, deps|
+        end
+      end
+    end.must_raise Roda::RodaPlugins::TypecastParams::ProgrammerError, /cyclic/
+  end
+
   it "#convert! with :missing=>:skip should not include missing values" do
     tp = tp()
     tp.convert!(:skip_missing=>true) do |ptp|
