@@ -502,4 +502,254 @@ base64 = Roda::RodaPlugins::Base64_
       [['{"a"=>"bar"}'], ['{"a" => "bar"}']].must_include b
     end
   end if Rack.release < '2.3'
+
+  describe "sessions plugin chunked cookies" do
+    # Cookie jar that keeps multiple cookies (one name per entry) and updates
+    # them from all Set-Cookie headers.  The built-in CookieJar combines the
+    # header into one string and only keeps a single cookie.
+    module ChunkedCookieJar
+      def req(path='/', env={})
+        if path.is_a?(Hash)
+          env = path
+        else
+          env['PATH_INFO'] = path.dup
+        end
+
+        @cookies ||= {}
+
+        if env['HTTP_COOKIE'].nil? && @cookies && !@cookies.empty?
+          env['HTTP_COOKIE'] = @cookies.map{|k, v| "#{k}=#{v}"}.join('; ')
+        end
+
+        a = super(env)
+
+        Array(a[1][RodaResponseHeaders::SET_COOKIE]).each do |cookie|
+          name, value = cookie.split('=', 2)
+          # A deletion cookie is sent as "name=; ..." or "name=;...", so an
+          # empty value before the first semicolon means the cookie was deleted.
+          if value.nil? || value.empty? || value.start_with?(';')
+            @cookies.delete(name)
+          else
+            value = value.split(';', 2)[0]
+            @cookies[name] = value
+          end
+        end
+
+        a
+      end
+
+      def cookies_sent
+        @cookies ||= {}
+      end
+    end
+
+    include ChunkedCookieJar
+
+    def req(path, opts={})
+      @errors ||= StringIO.new
+      super(path, opts.merge('rack.errors'=>@errors))
+    end
+
+    def errors
+      @errors.rewind
+      e = @errors.read.split("\n")
+      @errors.rewind
+      @errors.truncate(0)
+      e
+    end
+
+    def session_cookie_names
+      cookies_sent.keys.select{|k| k =~ /\Aroda\.session(?:#\d+)?\z/}.sort
+    end
+
+    def chunk_cookie_names
+      cookies_sent.keys.select{|k| k =~ /\Aroda\.session#\d+\z/}.sort
+    end
+
+    before do
+      @cookies = {}
+      app(:bare) do
+        plugin :sessions, :secret=>'1'*64, :chunked_cookies=>true, :cookie_chunk_size=>240, :max_cookie_chunks=>10, :pad_size=>nil
+        route do |r|
+          r.get('s', String, String){|k, v| session[k] = v; v}
+          r.get('g', String){|k| session[k].to_s}
+          r.get('sc'){session.clear; 'c'}
+          r.get('cs', String, String){|k, v| clear_session; session[k] = v}
+          ''
+        end
+      end
+    end
+
+    it "validates chunk related options" do
+      proc{app(:bare){plugin :sessions, :secret=>'1'*64, :chunked_cookies=>true, :cookie_chunk_size=>63}}.must_raise Roda::RodaError
+      proc{app(:bare){plugin :sessions, :secret=>'1'*64, :chunked_cookies=>true, :cookie_chunk_size=>4096}}.must_raise Roda::RodaError
+      proc{app(:bare){plugin :sessions, :secret=>'1'*64, :chunked_cookies=>true, :max_cookie_chunks=>1}}.must_raise Roda::RodaError
+      proc{app(:bare){plugin :sessions, :secret=>'1'*64, :chunked_cookies=>true, :max_cookie_chunks=>256}}.must_raise Roda::RodaError
+      proc{app(:bare){plugin :sessions, :secret=>'1'*64, :chunked_cookies=>true, :max_total_session_bytes=>0}}.must_raise Roda::RodaError
+      proc{app(:bare){plugin :sessions, :secret=>'1'*64, :max_total_session_bytes=>4000}}.must_raise Roda::RodaError
+    end
+
+    it "stores large sessions as a complete signed value split across chunk cookies" do
+      long = 'x'*400
+      body('/s/foo/' + long).must_equal long
+
+      chunks = chunk_cookie_names
+      chunks.length.must_be :>=, 3
+      chunks.must_equal chunks.length.times.map{|i| "roda.session##{i}"}
+      body('/g/foo').must_equal long
+      errors.must_equal []
+
+      set_cookies = Array(header(RodaResponseHeaders::SET_COOKIE, '/s/foo/' + long, 'QUERY_STRING'=>''))
+      # Already stored above; make sure each chunk cookie uses the same attributes.
+      set_cookies.each do |cookie|
+        cookie.must_include('; path=/')
+        cookie.must_match(/; HttpOnly/i)
+        cookie.must_match(/; SameSite=Lax/i)
+      end
+    end
+
+    it "keeps small sessions in a single cookie and stays compatible with unchunked sessions" do
+      body('/s/foo/bar').must_equal 'bar'
+      session_cookie_names.must_equal ['roda.session']
+      chunk_cookie_names.must_equal []
+      body('/g/foo').must_equal 'bar'
+
+      # A cookie produced by an application without chunked cookie support is accepted.
+      unchunked_app = Class.new(Roda)
+      unchunked_app.plugin(:sessions, :secret=>'1'*64)
+      unchunked_app.route do |r|
+        r.get('s', String, String){|k, v| session[k] = v; v}
+      end
+      status, headers, _ = unchunked_app.call(req_env('PATH_INFO'=>'/s/foo/bar', 'rack.input'=>rack_input, 'rack.errors'=>StringIO.new))
+      status.must_equal 200
+      @cookies = {}
+      single = Array(headers[RodaResponseHeaders::SET_COOKIE]).first.split(';', 2)[0]
+      name, value = single.split('=', 2)
+      @cookies[name] = value
+      body('/g/foo').must_equal 'bar'
+      errors.must_equal []
+    end
+
+    it "does not restore a partial session when a chunk is missing and clears the stale chunks when rewritten" do
+      body('/s/foo/' + 'x'*400).must_equal 'x'*400
+      saved = cookies_sent.dup
+      saved.delete('roda.session#2')
+      @cookies = saved
+
+      body('/g/foo').must_equal ''
+      errors.must_equal ["Unable to decode session: session chunk count mismatch"]
+
+      # The failed load itself expires every submitted chunk, rather than leaving
+      # a half session usable on the client.
+      _, h, _ = req('/g/foo')
+      deletion_cookies = Array(h[RodaResponseHeaders::SET_COOKIE])
+      saved.each_key do |name|
+        deletion_cookies.any?{|c| c.start_with?("#{name}=;")}.must_equal true
+      end
+
+      # A subsequent write starts a new single cookie session and cannot recover
+      # any of the stale data.
+      _, _, b = req('/s/foo/bar')
+      b.must_equal ['bar']
+      cookies_sent.keys.grep(/\Aroda\.session#/).must_equal []
+      body('/g/foo').must_equal 'bar'
+    end
+
+    it "does not accept a duplicated chunk or chunks mixed from different writes" do
+      body('/s/foo/' + 'x'*400).must_equal 'x'*400
+      first = cookies_sent.dup
+
+      body('/s/foo/' + 'y'*400).must_equal 'y'*400
+      second = cookies_sent.dup
+
+      # Browser sends two cookies with the same chunk name.  Rack keeps the first
+      # value, so duplicate detection must read the raw Cookie header.
+      duplicate_header = "roda.session#0=#{first['roda.session#0']}; roda.session#0=#{second['roda.session#0']}; " + (1...first.length).map{|i| "roda.session##{i}=#{first["roda.session##{i}"]}"}.join('; ')
+      body('/g/foo', 'HTTP_COOKIE'=>duplicate_header).must_equal ''
+      errors.must_equal ["Unable to decode session: duplicate session chunks"]
+
+      # Mix the manifest from the first write with later chunks from the second.
+      @cookies = second.dup
+      @cookies['roda.session#0'] = first['roda.session#0']
+      body('/g/foo').must_equal ''
+      errors.must_equal ["Unable to decode session: session chunks do not match manifest"]
+    end
+
+    it "deletes extra chunks when a chunked session shrinks to two chunks or a single cookie" do
+      @app.plugin :sessions, :cookie_chunk_size=>120, :pad_size=>nil
+
+      body('/s/foo/' + 'x'*300).must_equal 'x'*300
+      original_chunks = chunk_cookie_names
+      original_chunks.length.must_equal 5
+
+      body('/s/foo/' + 'y'*60).must_equal 'y'*60
+      new_chunks = chunk_cookie_names
+      new_chunks.must_equal ['roda.session#0', 'roda.session#1']
+
+      deleted = original_chunks - new_chunks
+      deleted.wont_equal []
+      _, h, _ = req('/g/foo')
+      h[RodaResponseHeaders::SET_COOKIE].must_be_nil
+      body('/g/foo').must_equal 'y'*60
+      errors.must_equal []
+
+      @app.plugin :sessions, :cookie_chunk_size=>240, :pad_size=>nil
+      body('/s/foo/bar').must_equal 'bar'
+      chunk_cookie_names.must_equal []
+      session_cookie_names.must_equal ['roda.session']
+      body('/g/foo').must_equal 'bar'
+    end
+
+    it "deletes all chunks when the session is cleared with session.clear or clear_session" do
+      body('/s/foo/' + 'x'*400).must_equal 'x'*400
+      chunk_count = chunk_cookie_names.length
+      chunk_count.must_be :>=, 3
+
+      _, h, b = req('/sc')
+      b.must_equal ['c']
+      set_cookies = Array(h[RodaResponseHeaders::SET_COOKIE])
+      # One deletion for the base cookie plus one per submitted chunk.
+      set_cookies.length.must_equal chunk_count + 1
+      set_cookies.each do |cookie|
+        cookie.must_match(/=; path=\/; max-age=0; expires=Thu, 01 Jan 1970 00:00:00 (-0000|GMT); HttpOnly(; SameSite=Lax)?/i)
+      end
+      chunk_cookie_names.must_equal []
+      body('/g/foo').must_equal ''
+
+      body('/cs/foo/' + 'z'*400).must_equal 'z'*400
+      chunk_count = chunk_cookie_names.length
+      _, h, _ = req('/sc')
+      Array(h[RodaResponseHeaders::SET_COOKIE]).length.must_equal chunk_count + 1
+    end
+
+    it "deletes chunk cookies when a chunked session expires" do
+      body('/s/foo/' + 'x'*400).must_equal 'x'*400
+      chunk_count = chunk_cookie_names.length
+      @app.plugin :sessions, :max_idle_seconds=>-1
+
+      _, h, _ = req('/g/foo')
+      Array(h[RodaResponseHeaders::SET_COOKIE]).length.must_equal chunk_count
+      errors.must_equal ["Not returning session: maximum session idle time expired"]
+      chunk_cookie_names.must_equal []
+
+      # Restore a normal expiration policy, then create a new single cookie
+      # session that cannot recover any of the expired data.
+      @app.plugin :sessions, :max_idle_seconds=>86400*7
+      _, h, b = req('/s/foo/bar')
+      b.must_equal ['bar']
+      set_cookies = Array(h[RodaResponseHeaders::SET_COOKIE])
+      set_cookies.length.must_equal 1
+      set_cookies.first.start_with?('roda.session=').must_equal true
+      cookies_sent.keys.grep(/\Aroda\.session#/).must_equal []
+      body('/g/foo').must_equal 'bar'
+    end
+
+    it "raises CookieTooLarge when total size or chunk count limits are exceeded" do
+      @app.plugin :sessions, :cookie_chunk_size=>120, :max_cookie_chunks=>3, :chunked_cookies=>true, :pad_size=>nil
+      proc{body('/s/foo/' + 'x'*300)}.must_raise Roda::RodaPlugins::Sessions::CookieTooLarge
+
+      @app.plugin :sessions, :cookie_chunk_size=>120, :max_cookie_chunks=>10, :max_total_session_bytes=>100, :chunked_cookies=>true, :pad_size=>nil
+      proc{body('/s/foo/' + 'x'*300)}.must_raise Roda::RodaPlugins::Sessions::CookieTooLarge
+    end
+  end
 end

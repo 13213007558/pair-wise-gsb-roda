@@ -46,7 +46,9 @@ class Roda
     # and remove support for them once old sessions have converted or timed out.
     #
     # If the final cookie is too large (>=4096 bytes), a Roda::RodaPlugins::Sessions::CookieTooLarge
-    # exception will be raised.
+    # exception will be raised.  If +:chunked_cookies+ is enabled, session data that would be too large
+    # for a single cookie can instead be split across multiple cookies, see the chunked cookie options
+    # below.
     #
     # = Required Options
     #
@@ -63,7 +65,18 @@ class Roda
     #                    to javascript, allowed for all paths, and will not be used for cross-site non-GET requests
     #                    that.  If the +:secure+ option is not present in the hash, then
     #                    <tt>secure: true</tt> is also set if the request is made over HTTPS.  If this option is
-    #                    given, it will be merged into the default cookie options.
+    #                    given, it will be merged into the default cookie options.  All session cookies,
+    #                    including each chunk when chunked cookies are used, are set and deleted with the
+    #                    same merged options.
+    # :chunked_cookies :: Allow session data that is too large for a single cookie to be stored across
+    #                     multiple cookies (default: +false+).  The entire encrypted and signed session is
+    #                     written at one time, so chunks from different writes cannot be mixed together
+    #                     to reconstruct a session.  Chunk cookies use the +:key+ followed by a # and the
+    #                     zero-based chunk number (for example, <tt>roda.session#0</tt>).
+    # :cookie_chunk_size :: When chunked cookies are enabled, the maximum size in bytes of the encoded
+    #                       session data stored in a single chunk cookie before it is split into another
+    #                       cookie (default: 2800).  Each emitted cookie is still subject to the browser
+    #                       4096 byte cookie limit.  This must be an integer between 64 and 4095.
     # :env_key :: The key in `env` where the session should be located. Defaults to <tt>"rack.session"</tt>, the
     #             default key for sessions in Rack.
     # :gzip_over (deprecated) :: For session data over this many bytes, compress it with the deflate algorithm (default: nil,
@@ -73,9 +86,16 @@ class Roda
     # :max_seconds :: The maximum number of seconds to allow for total session lifetime, starting with when
     #                 the session was originally created.  Default is <tt>86400*30</tt> (30 days). Can be set to
     #                 +nil+ to disable session lifetime checks.
+    # :max_cookie_chunks :: The maximum number of chunk cookies allowed for a single session when
+    #                       +:chunked_cookies+ is enabled (default: 12).  This must be an integer between
+    #                       2 and 255.
     # :max_idle_seconds :: The maximum number of seconds to allow since the session was last updated.
     #                      Default is <tt>86400*7</tt> (7 days).  Can be set to nil to disable session idleness
     #                      checks.
+    # :max_total_session_bytes :: The maximum allowed size in bytes of the encoded single session data
+    #                             before it is split into chunk cookies (default: 32768).  This must be a
+    #                             positive integer.  If the encoded session is larger than this, or requires
+    #                             more than +:max_cookie_chunks+ cookies, CookieTooLarge is raised.
     # :old_secret :: The previous secret to use, allowing for secret rotation.  Must be a string of at least 64
     #                bytes if given.
     # :pad_size :: Pad session data (after possible compression, before encryption), to a multiple of this
@@ -147,15 +167,44 @@ class Roda
     # padding :: >=0 padding bytes specified in bitmap, filled with random data, can be ignored.
     # serialized data :: >=2 bytes of serialized data in JSON format.  If the bitmap indicates
     #                    deflate compression, this contains the deflate compressed data.
+    #
+    # = Chunked Session Cookie Format
+    #
+    # When +:chunked_cookies+ is enabled and the encoded session does not fit in a single cookie, the
+    # complete signed value described above is split across consecutive cookies.  Each chunk value uses
+    # the following format:
+    #
+    #   urlsafe_base64("\2" + random nonce + chunk index + chunk count + session data fragment)
+    #
+    # where:
+    #
+    # version :: 1 byte, always 2 for chunked session cookies.
+    # random nonce :: 16 bytes, shared by all chunks from a single write.  It identifies the write, so a
+    #                 session is not reconstructed from chunks left over from different writes.
+    # chunk index :: 1 byte, zero based index of the chunk.  Chunk 0 is the manifest chunk.
+    # chunk count :: 1 byte, total number of chunks in the write.
+    # session data fragment :: consecutive bytes of the complete encoded single cookie value.  Chunks are
+    #                          concatenated in index order and the result must equal one complete value.
+    #
+    # Reading a chunked session requires every chunk from zero through one less than the chunk count,
+    # with no missing or duplicate chunk numbers and the same nonce and count in every chunk.  The
+    # reconstructed value is then verified and decrypted using the same format as a single session cookie.
+    # Existing single cookie sessions remain supported; when a session shrinks, the stale chunk cookies are
+    # deleted, and when a session is cleared or expires the chunk cookies are deleted.
     module Sessions
       DEFAULT_COOKIE_OPTIONS = {:httponly=>true, :path=>'/'.freeze, :same_site=>:lax}.freeze
-      DEFAULT_OPTIONS = {:key => 'roda.session'.freeze, :max_seconds=>86400*30, :max_idle_seconds=>86400*7, :pad_size=>32, :gzip_over=>nil, :skip_within=>3600, :env_key=>'rack.session'}.freeze
+      DEFAULT_OPTIONS = {:key => 'roda.session'.freeze, :max_seconds=>86400*30, :max_idle_seconds=>86400*7, :pad_size=>32, :gzip_over=>nil, :skip_within=>3600, :env_key=>'rack.session', :chunked_cookies=>false, :cookie_chunk_size=>2800, :max_cookie_chunks=>12, :max_total_session_bytes=>32768}.freeze
       DEFLATE_BIT  = 0x1000
       PADDING_MASK = 0x0fff
+      CHUNKED_SESSION_VERSION = 2
+      CHUNK_HEADER_SIZE = 19
+      CHUNK_COOKIE_KEY_SEPARATOR = '#'.freeze
       SESSION_CREATED_AT = 'roda.session.created_at'.freeze
       SESSION_UPDATED_AT = 'roda.session.updated_at'.freeze
       SESSION_SERIALIZED = 'roda.session.serialized'.freeze
       SESSION_VERSION_NUM = 'roda.session.version'.freeze
+      SESSION_CHUNK_KEYS = 'roda.session.chunk_keys'.freeze
+      SESSION_DELETE_CHUNKS = 'roda.session.delete_chunks'.freeze
       SESSION_DELETE_RACK_COOKIE = 'roda.session.delete_rack_session_cookie'.freeze
 
       # Exception class used when creating a session cookie that would exceed the
@@ -211,6 +260,25 @@ class Roda
         else
           raise RodaError, "invalid :pad_size option: #{opts[:pad_size].inspect}, must be Integer or nil"
         end
+
+        chunk_size = opts[:cookie_chunk_size]
+        unless chunk_size.is_a?(Integer) && chunk_size >= 64 && chunk_size < 4096
+          raise RodaError, "invalid :cookie_chunk_size option: #{chunk_size.inspect}, must be Integer >=64 and <4096"
+        end
+
+        max_chunks = opts[:max_cookie_chunks]
+        unless max_chunks.is_a?(Integer) && max_chunks >= 2 && max_chunks <= 255
+          raise RodaError, "invalid :max_cookie_chunks option: #{max_chunks.inspect}, must be Integer >=2 and <=255"
+        end
+
+        max_total = opts[:max_total_session_bytes]
+        unless max_total.is_a?(Integer) && max_total > 0
+          raise RodaError, "invalid :max_total_session_bytes option: #{max_total.inspect}, must be positive Integer"
+        end
+
+        unless opts[:chunked_cookies] || max_total >= 4096
+          raise RodaError, ":max_total_session_bytes option cannot be less than 4096 unless :chunked_cookies is enabled"
+        end
         
         app.opts[:sessions] = opts.freeze
         app.opts[:sessions_convert_symbols] = true unless app.opts.has_key?(:sessions_convert_symbols)
@@ -239,6 +307,8 @@ class Roda
         def _roda_after_50__sessions(res)
           if res && (session = env[self.class.sessions_opts[:env_key]])
             @_request.persist_session(res[1], session)
+          elsif res && env[SESSION_DELETE_CHUNKS]
+            @_request.delete_invalid_session_chunks(res[1])
           end
         end
       end
@@ -271,41 +341,45 @@ class Roda
         # sent in the future.
         def persist_session(headers, session)
           opts = roda_class.sessions_opts
+          key = opts[:key]
+          chunk_keys = env[SESSION_CHUNK_KEYS]
 
           if session.empty?
             if env[SESSION_SERIALIZED]
               # If session was submitted and is now empty, remove the cookie
-              Rack::Utils.delete_cookie_header!(headers, opts[:key], opts[:remove_cookie_options])
-            # else
+              Rack::Utils.delete_cookie_header!(headers, key, opts[:remove_cookie_options])
               # If no session was submitted, and the session is empty
-              # then there is no need to do anything
+              # then there is no need to do anything.
+            end
+            # Remove all chunk cookies sent by the client.  This handles a session that
+            # is cleared by the application, a chunked session that has expired, and
+            # chunk cookies that could not be decoded into a valid session.
+            if chunk_keys
+              chunk_keys.each do |chunk_key|
+                Rack::Utils.delete_cookie_header!(headers, chunk_key, opts[:remove_cookie_options])
+              end
             end
           elsif cookie_value = _serialize_session(session)
             cookie = Hash[opts[:cookie_options]]
             cookie[:value] = cookie_value
             cookie[:secure] = true if !cookie.has_key?(:secure) && ssl?
 
-            before_size = if (set_cookie_before = headers[RodaResponseHeaders::SET_COOKIE]).is_a?(String)
-              set_cookie_before.bytesize
-            else
-              0
-            end
+            set_cookie_before = headers[RodaResponseHeaders::SET_COOKIE]
+            before_size = set_cookie_before.is_a?(String) ? set_cookie_before.bytesize : 0
+            Rack::Utils.set_cookie_header!(headers, key, cookie)
 
-            Rack::Utils.set_cookie_header!(headers, opts[:key], cookie)
-
-            cookie_size = case set_cookie_after = headers[RodaResponseHeaders::SET_COOKIE]
-            when String
-              # Rack < 3 always takes this branch, combines cookies into string, subtract previous size
-              # Rack 3+ takes this branch if this is the first cookie set, in which case before size is 0
-              set_cookie_after.bytesize - before_size
-            else # when Array
-              # Rack 3+ takes branch if this is not the first cookie set, and last element of the array
-              # is most recently added cookie
-              set_cookie_after.last.bytesize
-            end
-
-            if cookie_size >= 4096
-              raise CookieTooLarge, "attempted to create cookie larger than 4096 bytes (bytes: #{cookie_size})"
+            cookie_size = _session_cookie_size(headers, set_cookie_before, before_size)
+            if _persist_session_as_chunks?(cookie_value, opts, cookie_size)
+              if opts[:chunked_cookies]
+                _persist_chunked_session(headers, cookie_value, cookie, key, chunk_keys, set_cookie_before)
+              else
+                _raise_cookie_to_large(headers, set_cookie_before, before_size)
+              end
+            elsif chunk_keys
+              # A single cookie is now used, so expire all chunk cookies sent by
+              # the client (for example, when the session has shrunk below the
+              # chunking limit).
+              _delete_stale_session_chunks(headers, chunk_keys)
             end
           end
           
@@ -316,6 +390,16 @@ class Roda
           nil
         end
 
+        # Expire all session chunk cookies that could not be restored into a
+        # complete session (missing, duplicate, mismatched, or expired chunks).
+        def delete_invalid_session_chunks(headers)
+          opts = roda_class.sessions_opts
+          (env[SESSION_CHUNK_KEYS] || []).each do |chunk_key|
+            Rack::Utils.delete_cookie_header!(headers, chunk_key, opts[:remove_cookie_options])
+          end
+          nil
+        end
+
         private
 
         # Load the session by looking for the appropriate cookie, or falling
@@ -323,12 +407,219 @@ class Roda
         def _load_session
           opts = roda_class.sessions_opts
           cs = cookies
+          chunk_cookies, duplicate_chunks = _chunk_session_cookies(opts[:key])
+          unless chunk_cookies.empty?
+            env[SESSION_CHUNK_KEYS] = chunk_cookies.keys.sort.map{|index| _chunk_cookie_key(opts[:key], index)}
+          end
 
           if data = cs[opts[:key]]
             _deserialize_session(data)
+          elsif chunk_cookies.length > 0
+            session = _deserialize_chunked_session(chunk_cookies, duplicate_chunks)
+            env[SESSION_DELETE_CHUNKS] = true unless session
+            session
           elsif (key = opts[:upgrade_from_rack_session_cookie_key]) && (data = cs[key])
             _deserialize_rack_session(data)
           end || {}
+        end
+
+        # The cookie name for the given zero-based session chunk index.
+        def _chunk_cookie_key(key, index)
+          "#{key}#{CHUNK_COOKIE_KEY_SEPARATOR}#{index}"
+        end
+
+        # Parse the raw Cookie header for session chunks, since the parsed cookie
+        # hash keeps only the first cookie with a given name and therefore cannot
+        # detect duplicate chunks sent by a client.  Returns a hash of chunk index
+        # to cookie value and an array of indexes that were sent more than once.
+        def _chunk_session_cookies(key)
+          chunks = {}
+          duplicates = []
+          prefix = key + CHUNK_COOKIE_KEY_SEPARATOR
+          cookie_header = @env['HTTP_COOKIE']
+          return [chunks, duplicates] unless cookie_header
+
+          cookie_header.split(/; */n).each do |cookie|
+            next if cookie.empty?
+            name, value = cookie.split('=', 2)
+            next unless name.start_with?(prefix)
+
+            index_string = name.byteslice(prefix.bytesize, name.bytesize - prefix.bytesize)
+            next unless index_string =~ /\A(?:0|[1-9][0-9]*)\z/
+            index = index_string.to_i
+            next if index > 255
+
+            # Match Rack::Utils.parse_cookies_header, which keeps the first cookie
+            # with a given name and unescapes the value.
+            value = (Rack::Utils.unescape(value) rescue value)
+
+            if chunks.key?(index)
+              duplicates << index unless duplicates.include?(index)
+            else
+              chunks[index] = value
+            end
+          end
+
+          [chunks, duplicates]
+        end
+
+        # Rebuild a session from chunk cookies, verifying the manifest, chunk
+        # numbers and total count before handing the complete value to the normal
+        # single cookie verification and decryption path.
+        def _deserialize_chunked_session(chunks, duplicates)
+          if !duplicates.empty?
+            return _session_serialization_error("Unable to decode session: duplicate session chunks")
+          end
+
+          manifest_value = chunks[0]
+          unless manifest_value
+            return _session_serialization_error("Unable to decode session: missing session chunk manifest")
+          end
+
+          manifest = _decode_session_chunk(0, manifest_value) || return
+          chunk_version, nonce, manifest_index, chunk_count = manifest.unpack("Ca16CC")
+
+          if chunk_version != CHUNKED_SESSION_VERSION || manifest_index != 0 || chunk_count < 2 || chunk_count > roda_class.sessions_opts[:max_cookie_chunks]
+            return _session_serialization_error("Unable to decode session: invalid session chunk manifest")
+          end
+
+          unless chunks.length == chunk_count && chunks.keys.all?{|index| index >= 0 && index < chunk_count}
+            return _session_serialization_error("Unable to decode session: session chunk count mismatch")
+          end
+
+          cookie_value = String.new
+          chunk_count.times do |index|
+            chunk = _decode_session_chunk(index, chunks[index]) || return
+            version, chunk_nonce, chunk_index, total_chunks = chunk.unpack("Ca16CC")
+
+            unless version == CHUNKED_SESSION_VERSION && chunk_index == index && total_chunks == chunk_count && Rack::Utils.secure_compare(chunk_nonce, nonce)
+              return _session_serialization_error("Unable to decode session: session chunks do not match manifest")
+            end
+
+            cookie_value << chunk.byteslice(CHUNK_HEADER_SIZE, chunk.bytesize - CHUNK_HEADER_SIZE)
+          end
+
+          _deserialize_session(cookie_value)
+        end
+
+        # Decode a single session chunk cookie value and verify its fixed size header.
+        def _decode_session_chunk(index, value)
+          begin
+            chunk = Base64_.urlsafe_decode64(value.to_s)
+          rescue ArgumentError
+            return _session_serialization_error("Unable to decode session chunk #{index}: invalid base64")
+          end
+
+          unless chunk.getbyte(0) == CHUNKED_SESSION_VERSION && chunk.bytesize > CHUNK_HEADER_SIZE
+            return _session_serialization_error("Unable to decode session chunk #{index}: invalid chunk data")
+          end
+
+          chunk
+        end
+
+        # Return the bytesize of the most recently set cookie in the response
+        # headers.  With Rack < 3 all Set-Cookie values are joined into one
+        # string, so the previous header size must be subtracted.
+        def _session_cookie_size(headers, set_cookie_before, before_size)
+          case set_cookie_after = headers[RodaResponseHeaders::SET_COOKIE]
+          when String
+            set_cookie_after.bytesize - before_size
+          else
+            set_cookie_after.last.bytesize
+          end
+        end
+
+        # Whether the encoded single cookie value should be split into chunks.
+        # With chunked cookie support enabled, :cookie_chunk_size determines the
+        # threshold on the encoded value.  Otherwise, splitting is only considered
+        # at the browser cookie size limit so that CookieTooLarge can be raised.
+        def _persist_session_as_chunks?(cookie_value, opts, cookie_size)
+          if opts[:chunked_cookies]
+            cookie_value.bytesize > opts[:cookie_chunk_size]
+          else
+            cookie_size >= 4096
+          end
+        end
+
+        # Revert the oversized single cookie and raise the same error used when
+        # chunked cookie support is disabled.
+        def _raise_cookie_to_large(headers, set_cookie_before, before_size)
+          size = _session_cookie_size(headers, set_cookie_before, before_size)
+          raise CookieTooLarge, "attempted to create cookie larger than 4096 bytes (bytes: #{size})"
+        end
+
+        # Store a complete encoded session across multiple chunk cookies.  The
+        # session is encrypted and signed as a whole before it is split, and all
+        # chunks from one write share a random nonce so chunks from different
+        # writes cannot be combined when reading the session.
+        def _persist_chunked_session(headers, cookie_value, cookie, key, chunk_keys, set_cookie_before)
+          opts = roda_class.sessions_opts
+
+          if cookie_value.bytesize > opts[:max_total_session_bytes]
+            raise CookieTooLarge, "attempted to create session larger than #{opts[:max_total_session_bytes]} bytes (bytes: #{cookie_value.bytesize})"
+          end
+
+          chunk_size = opts[:cookie_chunk_size]
+          chunk_count = (cookie_value.bytesize / chunk_size.to_f).ceil
+
+          if chunk_count > opts[:max_cookie_chunks]
+            raise CookieTooLarge, "attempted to create session requiring #{chunk_count} cookies, limit is #{opts[:max_cookie_chunks]}"
+          end
+
+          # Restore the header without the oversized single cookie, then set the
+          # full chunk set with the same cookie options.
+          if set_cookie_before.nil?
+            headers.delete(RodaResponseHeaders::SET_COOKIE)
+          else
+            headers[RodaResponseHeaders::SET_COOKIE] = set_cookie_before
+          end
+
+          nonce = SecureRandom.random_bytes(16)
+          chunk_count.times do |index|
+            chunk = String.new
+            chunk << CHUNKED_SESSION_VERSION
+            chunk << nonce
+            chunk << [index, chunk_count].pack("CC")
+            chunk << cookie_value.byteslice(index * chunk_size, chunk_size)
+
+            chunk_cookie = cookie.dup
+            chunk_cookie[:value] = Base64_.urlsafe_encode64(chunk)
+            chunk_key = _chunk_cookie_key(key, index)
+
+            before = headers[RodaResponseHeaders::SET_COOKIE]
+            before_size = before.is_a?(String) ? before.bytesize : 0
+
+            Rack::Utils.set_cookie_header!(headers, chunk_key, chunk_cookie)
+
+            size = _session_cookie_size(headers, before, before_size)
+            if size >= 4096
+              raise CookieTooLarge, "attempted to create session chunk cookie larger than 4096 bytes (bytes: #{size}); reduce :cookie_chunk_size"
+            end
+          end
+
+          # Expire chunk indexes from the previous write that are no longer used
+          # after the session shrank.  Indexes below chunk_count were overwritten
+          # with the new chunk values and the same cookie options above.
+          if chunk_keys
+            stale_keys = chunk_keys[chunk_count, chunk_keys.length] || []
+            stale_keys.each do |chunk_key|
+              Rack::Utils.delete_cookie_header!(headers, chunk_key, opts[:remove_cookie_options])
+            end
+          elsif cookies.key?(key)
+            # A single cookie existed before the session grew; expire it so the
+            # browser does not send both representations on later requests.
+            Rack::Utils.delete_cookie_header!(headers, key, opts[:remove_cookie_options])
+          end
+          nil
+        end
+
+        # Delete submitted chunk cookies that are not part of a freshly written
+        # single cookie session.
+        def _delete_stale_session_chunks(headers, chunk_keys)
+          opts = roda_class.sessions_opts
+          chunk_keys.each do |chunk_key|
+            Rack::Utils.delete_cookie_header!(headers, chunk_key, opts[:remove_cookie_options])
+          end
         end
 
         # If 'rack.errors' is set, write the error message to it.
@@ -531,10 +822,6 @@ class Roda
           data << OpenSSL::HMAC.digest(OpenSSL::Digest::SHA256.new, opts[:hmac_secret], data+opts[:key])
 
           data = Base64_.urlsafe_encode64(data)
-
-          if data.bytesize >= 4096
-            raise CookieTooLarge, "attempted to create cookie larger than 4096 bytes (bytes: #{data.bytesize})"
-          end
 
           data
         end
